@@ -1,0 +1,8 @@
+ultralytics
+onnxruntime-gpu
+supervision
+fastapi
+uvicorn[standard]
+opencv-python
+numpy
+python-multipart

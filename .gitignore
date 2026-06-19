@@ -1,0 +1,24 @@
+# Virtual Environments
+.venv/
+venv/
+env/
+__pycache__/
+*.pyc
+
+# Heavy Data & Video
+raw_data/
+merged_dataset/
+runs/
+*.avi
+*.mp4
+*.jpg
+*.png
+
+# Models
+models/
+*.pt
+*.onnx
+
+# IDEs
+.vscode/
+.idea/
