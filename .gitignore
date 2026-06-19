@@ -14,10 +14,7 @@ runs/
 *.jpg
 *.png
 
-# Models
-models/
-*.pt
-*.onnx
+# Models (Allowed so friend can download them)
 
 # IDEs
 .vscode/
