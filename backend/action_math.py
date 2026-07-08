@@ -39,12 +39,12 @@ from typing import List, Tuple, Optional, Dict
 # ============================================================
 # Minimum jerk magnitude (pixels/frame³) to classify as a violent
 # impulse. This filters out smooth repetitive motions.
-JERK_THRESHOLD = 300.0
+JERK_THRESHOLD = 100.0  # Lowered to make detection more sensitive
 
 # Minimum cosine similarity between attacker wrist velocity and
 # victim head velocity to confirm momentum transfer (recoil).
 # Range: -1.0 (opposite) to 1.0 (identical direction).
-MOMENTUM_TRANSFER_THRESHOLD = 0.2
+MOMENTUM_TRANSFER_THRESHOLD = 0.05  # Lowered for higher sensitivity
 
 # Minimum number of frames of history required to compute
 # 3rd-order derivatives (velocity + acceleration + jerk = 3 diffs,

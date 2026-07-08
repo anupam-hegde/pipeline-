@@ -2,21 +2,25 @@ import os
 import shutil
 import random
 from pathlib import Path
+from tqdm import tqdm
 
 # ==========================================
 # CONFIGURATION
 # ==========================================
 # Update these paths to point to your actual local dataset folders
 FIRE_DIR = r"C:\Users\anupa\OneDrive\Documents\MEGA downloads\Merged_FireSmoke"
+FIRE2_DIR = r"C:\Users\anupa\OneDrive\Documents\MEGA downloads\dataset_v2\data"
 WEAPON_DIR = r"C:\Users\anupa\OneDrive\Documents\MEGA downloads\weapons\Merged"
 
 OUTPUT_DIR = "../merged_dataset"
 SPLIT_RATIO = 0.8  # 80% Training, 20% Validation
 
 # Class Remapping (Old ID -> New ID)
-# We reserve Class 0 for 'person' (pre-trained weights).
-FIRE_MAP = {0: 1}     # Assuming fire was class 0 in its source dataset
-WEAPON_MAP = {0: 2}   # Assuming weapon was class 0 in its source dataset
+# Class 0: fire (mapped from 0/1 in fire datasets)
+# Class 1: weapon (mapped from 0 in weapon dataset)
+FIRE_MAP = {0: 0, 1: 0}
+FIRE2_MAP = {0: 0, 1: 0}
+WEAPON_MAP = {0: 1}
 
 # Valid image extensions
 VALID_EXTENSIONS = {'.jpg', '.jpeg', '.png'}
@@ -52,24 +56,37 @@ def create_directories():
 # ==========================================
 def process_dataset(source_dir: str, class_map: dict, prefix: str, out_path: Path):
     """
-    Scans a source dataset, splits into Train/Val, maps class IDs, 
-    and copies files with a prefix to prevent collision.
+    Scans a source dataset (either direct images/labels or split train/val/test folders),
+    splits into Train/Val, maps class IDs, and copies files with a prefix to prevent collision.
     """
-    src_images_dir = Path(source_dir) / "images"
-    src_labels_dir = Path(source_dir) / "labels"
+    src_path = Path(source_dir)
+    subdirs_to_check = []
     
-    if not src_images_dir.exists() or not src_labels_dir.exists():
-        print(f"[!] WARNING: Source directory {source_dir} missing 'images/' or 'labels/' subfolder. Skipping.")
+    # Check if images/ and labels/ exist directly under source_dir
+    if (src_path / "images").exists() and (src_path / "labels").exists():
+        subdirs_to_check.append(src_path)
+    else:
+        # Check for standard split subdirectories (train, val, test, valid)
+        for split in ['train', 'val', 'test', 'valid']:
+            sub_img = src_path / split / "images"
+            sub_lbl = src_path / split / "labels"
+            if sub_img.exists() and sub_lbl.exists():
+                subdirs_to_check.append(src_path / split)
+                
+    if not subdirs_to_check:
+        print(f"[!] WARNING: Source directory {source_dir} missing 'images/' or 'labels/' subfolder(s). Skipping.")
         return 0, 0
 
-    # Gather valid image files
+    # Gather valid image files across all found subdirs
     valid_pairs = []
-    for img_file in src_images_dir.iterdir():
-        if img_file.suffix.lower() in VALID_EXTENSIONS:
-            # Check if corresponding label file exists
-            label_file = src_labels_dir / (img_file.stem + ".txt")
-            if label_file.exists():
-                valid_pairs.append((img_file, label_file))
+    for subdir in subdirs_to_check:
+        src_images_dir = subdir / "images"
+        src_labels_dir = subdir / "labels"
+        for img_file in src_images_dir.iterdir():
+            if img_file.suffix.lower() in VALID_EXTENSIONS:
+                label_file = src_labels_dir / (img_file.stem + ".txt")
+                if label_file.exists():
+                    valid_pairs.append((img_file, label_file))
                 
     if not valid_pairs:
         print(f"[!] No valid image/label pairs found in {source_dir}.")
@@ -86,7 +103,7 @@ def process_dataset(source_dir: str, class_map: dict, prefix: str, out_path: Pat
     # Process split helper function
     def copy_and_remap(pairs, split_name):
         count = 0
-        for img_path, lbl_path in pairs:
+        for img_path, lbl_path in tqdm(pairs, desc=f"Processing [{prefix}] -> {split_name}", leave=False):
             new_stem = f"{prefix}_{img_path.stem}"
             
             # 1. Copy Image
@@ -97,14 +114,18 @@ def process_dataset(source_dir: str, class_map: dict, prefix: str, out_path: Pat
             new_lbl_path = out_path / split_name / "labels" / (new_stem + ".txt")
             
             remapped_lines = []
-            with open(lbl_path, 'r') as f:
+            with open(lbl_path, 'r', errors='replace') as f:
                 lines = f.readlines()
                 for line in lines:
                     parts = line.strip().split()
                     if not parts:
                         continue
                     
-                    old_class_id = int(parts[0])
+                    try:
+                        old_class_id = int(parts[0])
+                    except ValueError:
+                        continue
+                        
                     # Remap the ID if it exists in the dictionary, otherwise keep it or drop it
                     if old_class_id in class_map:
                         new_class_id = class_map[old_class_id]
@@ -120,7 +141,8 @@ def process_dataset(source_dir: str, class_map: dict, prefix: str, out_path: Pat
             else:
                 # If no valid labels were found after mapping, we remove the copied image
                 # to prevent blank background images (unless intentional).
-                os.remove(new_img_path)
+                if new_img_path.exists():
+                    os.remove(new_img_path)
                 
         return count
 
@@ -149,9 +171,8 @@ val: {val_path}
 
 # Classes
 names:
-  0: person
-  1: fire
-  2: weapon
+  0: fire
+  1: weapon
 """
     with open(yaml_path, 'w') as f:
         f.write(yaml_content)
@@ -176,6 +197,12 @@ def main():
     t_f, v_f = process_dataset(FIRE_DIR, FIRE_MAP, prefix="fire", out_path=out_path)
     total_train += t_f
     total_val += v_f
+    
+    # Process Fire 2 (dataset_v2)
+    print(f"\nProcessing Second Fire/Smoke Dataset from: {FIRE2_DIR}")
+    t_f2, v_f2 = process_dataset(FIRE2_DIR, FIRE2_MAP, prefix="fire2", out_path=out_path)
+    total_train += t_f2
+    total_val += v_f2
     
     # Process Weapon
     print(f"\nProcessing Weapon Dataset from: {WEAPON_DIR}")

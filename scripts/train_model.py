@@ -1,78 +1,119 @@
+"""
+train_model.py — YOLOX-s Real-Time Surveillance Training Pipeline
+
+Migrated from RTMDet/MMDetection to pure PyTorch YOLOX-s.
+Zero compilation required. Runs natively on Windows with PyTorch 2.4 + CUDA.
+
+Features:
+  - Automatically verifies/converts YOLO format annotations to COCO JSON format.
+  - Automatically downloads pre-trained YOLOX-s COCO weights for transfer learning.
+  - Enforces FP16 Automatic Mixed Precision (AMP) for NVIDIA RTX 3050 (6 GB VRAM).
+  - High-frequency live console logging (every 10 batches) + TensorBoard.
+"""
+
 import os
-from ultralytics import YOLO
+import sys
+import urllib.request
+from pathlib import Path
+
+import torch
+from yolox.core import Trainer
+from yolox.tools.train import make_parser
+
+# Add repository root to path so we can import configs and scripts
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from configs.yolox_surveillance import Exp
+from scripts.convert_yolo_to_coco import convert_dataset_root, DEFAULT_CLASSES
+
+
+def ensure_coco_annotations(dataset_root: Path) -> None:
+    """Verifies COCO JSON annotations exist; if not, converts YOLO label files."""
+    print("\n[*] Step 1: Verifying dataset annotations...")
+    annotations_dir = dataset_root / "annotations"
+    train_json = annotations_dir / "train.json"
+    val_json = annotations_dir / "val.json"
+
+    if not train_json.exists() or not val_json.exists():
+        print("[!] COCO JSON annotations missing. Automatically converting from YOLO format...")
+        convert_dataset_root(dataset_root, DEFAULT_CLASSES)
+        print("[+] Dataset conversion complete!")
+    else:
+        print(f"[+] Found existing COCO annotations: {train_json.as_posix()}")
+
+
+def ensure_pretrained_backbone(models_dir: Path) -> Path:
+    """Downloads official YOLOX-s pre-trained COCO backbone weights if not present."""
+    print("\n[*] Step 2: Verifying pre-trained YOLOX-s backbone weights...")
+    models_dir.mkdir(parents=True, exist_ok=True)
+    ckpt_path = models_dir / "yolox_s.pth"
+
+    if not ckpt_path.exists():
+        url = "https://github.com/Megvii-BaseDetection/YOLOX/releases/download/0.1.1rc0/yolox_s.pth"
+        print(f"[*] Downloading YOLOX-s pre-trained weights from Megvii CDN:\n    {url}")
+        urllib.request.urlretrieve(url, ckpt_path)
+        print(f"[+] Download complete: {ckpt_path.as_posix()} ({ckpt_path.stat().st_size / 1e6:.1f} MB)")
+    else:
+        print(f"[+] Found pre-trained weights: {ckpt_path.as_posix()}")
+
+    return ckpt_path
+
 
 def main():
-    print("="*60)
-    print("🚀 YOLOv11n Surveillance Pipeline - Training Script")
-    print("="*60)
-    
-    # ---------------------------------------------------------
-    # Phase 1: Model Initialization & Transfer Learning
-    # ---------------------------------------------------------
-    # CRITICAL REQUIREMENT: Transfer Learning
-    # Instead of initializing a blank architecture (e.g., YOLO('yolo11n.yaml')), 
-    # we load the pre-trained COCO weights (yolo11n.pt). 
-    # The COCO dataset already contains the 'person' class. By using these weights 
-    # as our base, the model retains its pre-existing high-quality understanding 
-    # of human features. It only needs to learn our two new classes (fire, weapon) 
-    # while fine-tuning its person detection to our specific dataset constraints.
-    print("\n[*] Initializing YOLOv11n with pre-trained COCO weights...")
-    model = YOLO('yolo11n.pt')
+    print("=" * 60)
+    print("YOLOX-s Real-Time Surveillance Training Pipeline")
+    print("=" * 60)
 
-    # ---------------------------------------------------------
-    # Phase 2: Fine-Tuning / Training
-    # ---------------------------------------------------------
-    # VRAM Safety Profile for NVIDIA RTX 3050 (6GB VRAM)
-    #   - batch=8: Keeps gradient accumulation manageable for 6GB limits.
-    #   - imgsz=640: Standard high-res inference size without causing OOM.
-    #   - amp=True: Automatic Mixed Precision saves memory and speeds up CUDA math.
-    print("\n[*] Commencing Model Training...")
-    data_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'merged_dataset', 'data.yaml'))
-    
-    model.train(
-        data=data_path,
-        epochs=100,
-        imgsz=640,
-        batch=8,
-        device=0,         # Force CUDA execution
-        amp=True,         # Enable FP16/Mixed Precision for memory efficiency
-        workers=4,        # Dataloader threads (CPU)
-        project='models', # Save results to the /models directory
-        name='surveillance_run'
-    )
-    print("\n[*] Training Phase Completed.")
+    # 1. Check hardware & FP16 support
+    if not torch.cuda.is_available():
+        print("[!] WARNING: CUDA is not available! Training will fall back to CPU and be extremely slow.")
+        device_name = "CPU"
+    else:
+        device_name = torch.cuda.get_device_name(0)
+        vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+        print(f"[*] Hardware Detected: {device_name} ({vram_gb:.1f} GB VRAM)")
+        print("[*] Enforcing CUDA device execution (cuda:0) with FP16 Mixed Precision.")
 
-    # ---------------------------------------------------------
-    # Phase 3: ONNX Export for Inference Optimization
-    # ---------------------------------------------------------
-    print("\n[*] Reloading best weights for ONNX export...")
-    # We must load the specific 'best.pt' file that the training loop just produced
-    # to ensure we export the epoch with the highest validation mAP.
-    best_weights_path = os.path.join('models', 'surveillance_run', 'weights', 'best.pt')
-    
-    if not os.path.exists(best_weights_path):
-        print(f"[!] Critical Error: Could not find best weights at {best_weights_path}")
-        return
+    dataset_root = _REPO_ROOT / "merged_dataset"
+    models_dir = _REPO_ROOT / "models"
 
-    best_model = YOLO(best_weights_path)
+    # 2. Prepare data & checkpoint
+    ensure_coco_annotations(dataset_root)
+    ckpt_path = ensure_pretrained_backbone(models_dir)
 
-    print("\n[*] Exporting to FP16 ONNX format...")
-    # ONNX Export Parameters:
-    #   - half=True: Quantizes the weights from FP32 to FP16. This halves the
-    #                memory footprint on the GPU during WebSocket inference.
-    #   - simplify=True: Fuses operations and optimizes the ONNX graph for faster runtime.
-    best_model.export(
-        format='onnx',
-        half=True,
-        simplify=True,
-        device=0,
-        imgsz=640
-    )
-    
-    print("\n" + "="*60)
-    print("✅ Pipeline Successfully Trained and Exported!")
-    print(f"ONNX Model saved alongside: {best_weights_path.replace('.pt', '.onnx')}")
-    print("="*60)
+    # 3. Initialize YOLOX Experiment & Training Arguments
+    print("\n[*] Step 3: Initializing YOLOX-s training engine...")
+    exp = Exp()
+    args = make_parser().parse_args([])
+    args.experiment_name = exp.experiment_name
+    args.name = "yolox-s"
+    args.batch_size = 8       # Batch size 8 fits comfortably in 6 GB VRAM in FP16
+    args.devices = 1
+    args.fp16 = True          # Enable Automatic Mixed Precision (AMP)
+    args.ckpt = str(ckpt_path)
+    args.logger = "tensorboard"
+    args.occupy = False
+    args.cache = False        # Disabled on Windows (no fork support)
 
-if __name__ == '__main__':
+    print(f"[*] Experiment Name: {exp.experiment_name}")
+    print(f"[*] Target Epochs:   {exp.max_epoch}")
+    print(f"[*] Batch Size:      {args.batch_size}")
+    print(f"[*] Live Log Freq:   Every {exp.print_interval} batches")
+    print("=" * 60)
+
+    # 4. Launch Training
+    trainer = Trainer(exp, args)
+    try:
+        trainer.train()
+    except KeyboardInterrupt:
+        print("\n[!] Training interrupted by user. Best/latest checkpoint preserved in models/yolox_surveillance/")
+        sys.exit(0)
+    except Exception as exc:
+        print(f"\n[!] Training failed with error: {exc}")
+        raise
+
+
+if __name__ == "__main__":
     main()

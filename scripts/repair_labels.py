@@ -81,7 +81,7 @@ def repair_all_labels(merged_root):
             continue
 
         # Only target weapon labels since that's where malformed data is
-        weapon_labels = list(labels_dir.glob('weapon_*.txt'))
+        weapon_labels = list(labels_dir.glob('wpn_*.txt'))
         print(f"\n[*] Scanning {split} split: {len(weapon_labels)} weapon label files...")
 
         for label_path in tqdm(weapon_labels, desc=f"Repairing {split}"):

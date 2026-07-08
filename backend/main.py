@@ -3,7 +3,7 @@ main.py — FastAPI WebSocket Server for Real-Time Surveillance Pipeline
 
 This is the central state manager and WebSocket endpoint. It:
   1) Receives video frames from a client over WebSocket.
-  2) Runs YOLOv11 pose estimation + object detection.
+  2) Runs RTMPose pose estimation + YOLOX object detection.
   3) Tracks persons with ByteTrack (via supervision).
   4) Maintains a rolling 15-frame history per tracked person.
   5) Checks proximity between all tracked person pairs.
@@ -33,6 +33,14 @@ from backend.action_math import (
     detect_fall,
     extract_keypoint,
 )
+from backend.vision_models import (
+    create_object_detector,
+    create_pose_pipeline,
+    match_keypoints_to_bbox,
+)
+from backend.crowd_counter import CrowdCounter
+from backend.crowd_density import CrowdDensityEstimator, DensityThresholds
+from backend.history_manager import PersonHistoryManager
 
 # ============================================================
 # CONFIGURABLE CONSTANTS
@@ -55,11 +63,11 @@ VIOLENCE_ALERT_COOLDOWN = 2.0
 # Cooldown in seconds between fall alerts for the same person.
 FALL_ALERT_COOLDOWN = 3.0
 
-# YOLO confidence threshold for pose estimation
+# RTMPose confidence threshold for pose estimation
 POSE_CONFIDENCE = 0.5
 
-# YOLO keypoint index map (COCO 17-point format)
-# These map human body parts to array indices in YOLO pose output.
+# COCO 17-point keypoint index map.
+# RTMPose output is converted to this order in backend.vision_models.
 KP_NOSE = 0
 KP_LEFT_SHOULDER = 5
 KP_RIGHT_SHOULDER = 6
@@ -104,23 +112,9 @@ app.add_middleware(
 #       'hip_R':   deque(...),
 #       'centroid': (x, y),  # most recent centroid for proximity
 #   }
-person_states: Dict[int, Dict[str, Any]] = defaultdict(
-    lambda: {
-        'wrist_R': deque(maxlen=HISTORY_LENGTH),
-        'wrist_L': deque(maxlen=HISTORY_LENGTH),
-        'head': deque(maxlen=HISTORY_LENGTH),
-        'shoulder_L': deque(maxlen=HISTORY_LENGTH),
-        'shoulder_R': deque(maxlen=HISTORY_LENGTH),
-        'hip_L': deque(maxlen=HISTORY_LENGTH),
-        'hip_R': deque(maxlen=HISTORY_LENGTH),
-        'centroid': (0.0, 0.0),
-        'fall_streak': 0,
-        'is_fallen': False,
-        'bbox_ar': 1.0,
-        'bbox_width': 1.0,
-        'bbox_height': 1.0,
-    }
-)
+# Central Person History Manager: bounded circular deques for bboxes, pose keypoints, joint angles, velocities, timestamps
+history_manager = PersonHistoryManager(history_length=HISTORY_LENGTH, timeout_seconds=15.0)
+person_states = history_manager
 
 # Cooldown timestamps: maps frozenset({id_A, id_B}) → last_alert_time
 violence_cooldowns: Dict[frozenset, float] = {}
@@ -132,6 +126,8 @@ fall_cooldowns: Dict[int, float] = {}
 pose_model = None
 detection_model = None
 byte_tracker = None
+crowd_counter = None
+crowd_density_estimator = None
 
 
 # ============================================================
@@ -139,27 +135,23 @@ byte_tracker = None
 # ============================================================
 def load_models():
     """
-    Lazily loads YOLO models and ByteTrack tracker on first use.
+    Lazily loads RTMPose/YOLOX models and ByteTrack tracker on first use.
     This avoids slow startup and allows the server to boot even
     if model files are not yet present (fails on first request
     with a clear error instead of on import).
     """
-    global pose_model, detection_model, byte_tracker
+    global pose_model, detection_model, byte_tracker, crowd_counter, crowd_density_estimator
 
     if pose_model is None:
         try:
-            from ultralytics import YOLO
             import supervision as sv
 
-            # Pose model for keypoint extraction
-            # TODO: Update path to your trained .pt or .onnx model
-            pose_model = YOLO('models/yolo11n-pose.pt')
+            pose_model = create_pose_pipeline()
             print("[*] Pose model loaded successfully.")
 
-            # Detection model for fire/weapon detection
-            # TODO: Update path after training the merged dataset
-            # detection_model = YOLO('models/best.onnx')
-            # print("[*] Detection model loaded successfully.")
+            detection_model = create_object_detector()
+            if detection_model is not None:
+                print("[*] YOLOX custom object detector loaded successfully.")
 
             # ByteTrack tracker from supervision library
             byte_tracker = sv.ByteTrack(
@@ -170,62 +162,23 @@ def load_models():
             )
             print("[*] ByteTrack tracker initialized.")
 
+            crowd_counter = CrowdCounter()
+            crowd_density_estimator = CrowdDensityEstimator(
+                thresholds=DensityThresholds(
+                    medium_area_ratio=0.15,
+                    high_area_ratio=0.35,
+                    medium_person_count=5,
+                    high_person_count=12,
+                )
+            )
+            print("[*] Crowd analytics modules initialized.")
+
         except Exception as e:
             print(f"[!] Error loading models: {e}")
             raise
 
 
-# ============================================================
-# KEYPOINT HISTORY UPDATE
-# ============================================================
-def update_person_state(tracker_id: int, keypoints: np.ndarray):
-    """
-    Extracts relevant keypoints from a YOLO pose result and appends
-    them to the rolling history deque for the given tracked person.
-
-    If a keypoint is undetected (confidence too low), we append (0, 0)
-    which will be handled by the _fill_missing() function in action_math.
-
-    Args:
-        tracker_id: Unique ID from ByteTrack.
-        keypoints:  NumPy array of shape (17, 3) — [x, y, conf] per keypoint.
-    """
-    state = person_states[tracker_id]
-
-    # --- Extract and store each relevant keypoint ---
-    # Head (nose)
-    head = extract_keypoint(keypoints, KP_NOSE)
-    state['head'].append(head if head else (0.0, 0.0))
-
-    # Right wrist (primary strike hand)
-    wr = extract_keypoint(keypoints, KP_RIGHT_WRIST)
-    state['wrist_R'].append(wr if wr else (0.0, 0.0))
-
-    # Left wrist (fallback)
-    wl = extract_keypoint(keypoints, KP_LEFT_WRIST)
-    state['wrist_L'].append(wl if wl else (0.0, 0.0))
-
-    # Shoulders (for fall detection torso angle)
-    sl = extract_keypoint(keypoints, KP_LEFT_SHOULDER)
-    state['shoulder_L'].append(sl if sl else (0.0, 0.0))
-
-    sr = extract_keypoint(keypoints, KP_RIGHT_SHOULDER)
-    state['shoulder_R'].append(sr if sr else (0.0, 0.0))
-
-    # Hips (for fall detection torso angle)
-    hl = extract_keypoint(keypoints, KP_LEFT_HIP)
-    state['hip_L'].append(hl if hl else (0.0, 0.0))
-
-    hr = extract_keypoint(keypoints, KP_RIGHT_HIP)
-    state['hip_R'].append(hr if hr else (0.0, 0.0))
-
-    # --- Compute centroid for proximity checks ---
-    # Use the midpoint of the bounding box approximation (shoulders + hips)
-    valid_points = [p for p in [head, sl, sr, hl, hr] if p is not None]
-    if valid_points:
-        cx = sum(p[0] for p in valid_points) / len(valid_points)
-        cy = sum(p[1] for p in valid_points) / len(valid_points)
-        state['centroid'] = (cx, cy)
+# Keypoint history update and derived kinematics are now handled automatically by PersonHistoryManager
 
 
 # ============================================================
@@ -378,18 +331,13 @@ def check_falls(current_time: float) -> Tuple[list, dict]:
 # ============================================================
 # CLEANUP: Remove stale tracks
 # ============================================================
-def cleanup_stale_tracks(active_ids: set):
+def cleanup_stale_tracks(current_time: float):
     """
-    Removes person_states entries for tracker IDs that ByteTrack
-    has dropped (person left frame or lost tracking). This prevents
-    memory leaks during long-running surveillance sessions.
-
-    Args:
-        active_ids: Set of currently active tracker IDs from ByteTrack.
+    Removes person_states entries that have been inactive for longer than timeout_seconds.
+    This prevents memory leaks during long CCTV recordings while preserving tracks during momentary occlusions.
     """
-    stale_ids = [tid for tid in person_states if tid not in active_ids]
+    stale_ids = history_manager.cleanup_inactive(current_time)
     for tid in stale_ids:
-        del person_states[tid]
         violence_cooldowns.pop(frozenset({tid}), None)
         fall_cooldowns.pop(tid, None)
 
@@ -443,54 +391,51 @@ async def video_websocket(websocket: WebSocket):
             frame_count += 1
             current_time = time.time()
 
-            # --- Run YOLO Pose Estimation ---
-            results = pose_model(
-                frame,
-                conf=POSE_CONFIDENCE,
-                verbose=False
-            )
+            # --- Run person detection / initial pose estimation ---
+            raw_pose = pose_model.predict(frame, confidence=POSE_CONFIDENCE)
+            sv_detections = raw_pose.to_supervision()
+            tracked = byte_tracker.update_with_detections(sv_detections)
+
+            # --- Update Crowd Counting and Density Estimation ---
+            if crowd_counter is not None:
+                crowd_metrics = crowd_counter.update(tracked, current_time=current_time)
+            else:
+                crowd_metrics = None
+
+            if crowd_density_estimator is not None:
+                density_metrics = crowd_density_estimator.estimate(frame.shape, tracked)
+            else:
+                density_metrics = None
 
             detections_out = []
             active_tracker_ids = set()
 
-            if results and results[0].keypoints is not None:
-                result = results[0]
-
-                # --- ByteTrack: update tracker with detections ---
-                import supervision as sv
-                sv_detections = sv.Detections.from_ultralytics(result)
-                tracked = byte_tracker.update_with_detections(sv_detections)
+            if len(tracked) > 0:
+                # --- Run top-down pose estimation on tracked bounding boxes (Pre-Pose Tracking) ---
+                tracked_pose = pose_model.predict(
+                    frame, confidence=POSE_CONFIDENCE, tracked_boxes=tracked
+                )
 
                 # --- Process each tracked person ---
-                for idx in range(len(tracked)):
-                    # Extract tracker ID assigned by ByteTrack
-                    tracker_id = int(tracked.tracker_id[idx])
+                for idx in range(len(tracked_pose)):
+                    if tracked_pose.tracker_id is None:
+                        continue
+                    tracker_id = int(tracked_pose.tracker_id[idx])
                     active_tracker_ids.add(tracker_id)
 
                     # Extract bounding box [x1, y1, x2, y2]
-                    bbox = tracked.xyxy[idx].tolist()
-                    
-                    # Store bounding box dimensions for fall debounce logic
-                    state = person_states[tracker_id]
-                    width = max(1e-5, bbox[2] - bbox[0])
-                    height = max(1e-5, bbox[3] - bbox[1])
-                    state['bbox_width'] = width
-                    state['bbox_height'] = height
-                    state['bbox_ar'] = width / height
+                    bbox = tracked_pose.xyxy[idx].tolist()
 
-                    # Extract keypoints for this person
-                    # result.keypoints.data shape: (num_persons, 17, 3)
-                    if idx < len(result.keypoints.data):
-                        kps = result.keypoints.data[idx].cpu().numpy()
-                        update_person_state(tracker_id, kps)
+                    # Update Person History Manager with new bounding box, pose keypoints, and timestamp
+                    history_manager.update(tracker_id, bbox, tracked_pose.keypoints[idx], current_time)
 
                     detections_out.append({
                         'tracker_id': tracker_id,
                         'bbox': bbox,
                     })
 
-            # --- Cleanup stale tracks ---
-            cleanup_stale_tracks(active_tracker_ids)
+            # --- Automatically remove inactive tracks after timeout ---
+            cleanup_stale_tracks(current_time)
 
             # --- Run behavior analysis ---
             violence_alerts, violence_telemetry = check_violence_between_pairs(current_time)
@@ -552,6 +497,12 @@ async def video_websocket(websocket: WebSocket):
                         cv2.putText(frame, text, (mx - 50, my), 
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 2)
 
+            # --- Draw Crowd Analytics Overlays ---
+            if crowd_counter is not None and crowd_metrics is not None:
+                crowd_counter.draw_hud(frame, metrics=crowd_metrics, position=(20, 40))
+            if crowd_density_estimator is not None and density_metrics is not None:
+                crowd_density_estimator.draw_hud(frame, metrics=density_metrics, position=(20, 145))
+
             # --- Encode modified frame to base64 ---
             _, buffer = cv2.imencode('.jpg', frame)
             frame_annotated_b64 = base64.b64encode(buffer).decode('utf-8')
@@ -563,6 +514,16 @@ async def video_websocket(websocket: WebSocket):
                 'detections': detections_out,
                 'alerts': all_alerts,
                 'tracked_persons': len(active_tracker_ids),
+                'crowd_metrics': {
+                    'active_count': crowd_metrics.current_count if crowd_metrics else 0,
+                    'peak_count': crowd_metrics.peak_count if crowd_metrics else 0,
+                    'cumulative_unique': crowd_metrics.cumulative_count if crowd_metrics else 0,
+                },
+                'crowd_density': {
+                    'level': density_metrics.level.value if density_metrics else "LOW",
+                    'occupied_area_percent': round(density_metrics.occupied_area_ratio * 100, 1) if density_metrics else 0.0,
+                    'active_tracks': density_metrics.active_person_count if density_metrics else 0,
+                },
             }
             await websocket.send_json(response)
 

@@ -13,6 +13,8 @@ runs/
 *.mp4
 *.jpg
 *.png
+*.zip
+*.tar.gz
 
 # Models (Allowed so friend can download them)
 

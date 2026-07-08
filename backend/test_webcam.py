@@ -6,7 +6,6 @@ from collections import defaultdict, deque
 import cv2
 import numpy as np
 import supervision as sv
-from ultralytics import YOLO
 
 # Ensure backend package is in path so we can import action_math
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -16,12 +15,19 @@ from backend.action_math import (
     detect_fall,
     extract_keypoint,
 )
+from backend.vision_models import (
+    ObjectDetectionBatch,
+    create_object_detector,
+    create_pose_pipeline,
+    draw_object_detections,
+    match_keypoints_to_bbox,
+)
 
 # Constants
 HISTORY_LENGTH = 15
 PROXIMITY_THRESHOLD = 500.0  # Increased to handle subjects close to camera
 
-# YOLO COCO 17-point format indices
+# COCO 17-point format indices
 KP_NOSE = 0
 KP_LEFT_SHOULDER = 5
 KP_RIGHT_SHOULDER = 6
@@ -64,12 +70,11 @@ def main():
     parser.add_argument("--camera", type=int, default=0, help="Camera device index (default: 0)")
     args = parser.parse_args()
 
-    print("[*] Loading YOLO Pose Model...")
-    pose_model = YOLO("models/yolo11n-pose.pt")
+    print("[*] Loading RTMPose model...")
+    pose_model = create_pose_pipeline()
     
-    print("[*] Loading Custom Object Detection Model (PyTorch)...")
-    model_path = os.path.abspath(r"runs\detect\models\surveillance_run-3\weights\best.pt")
-    det_model = YOLO(model_path, task='detect')
+    print("[*] Loading optional YOLOX custom object detector...")
+    det_model = create_object_detector()
     
     print("[*] Initializing ByteTrack...")
     byte_tracker = sv.ByteTrack(
@@ -114,15 +119,17 @@ def main():
         # Flip frame horizontally for a more intuitive mirror effect
         frame = cv2.flip(frame, 1)
 
-        # Run YOLO Pose Estimation
-        results = pose_model(frame, verbose=False, conf=0.5)[0]
+        # Run RTMPose pose estimation
+        pose_results = pose_model.predict(frame, confidence=0.5)
         
-        # Run Custom Object Detection for Fire and Weapons
-        det_results = det_model(frame, verbose=False, conf=0.45)[0]
+        # Run custom YOLOX object detection for fire and weapons when configured.
+        det_results = (
+            det_model.predict(frame, confidence=0.45)
+            if det_model is not None
+            else ObjectDetectionBatch.empty()
+        )
         
-        # Filter for person class (class 0)
-        detections = sv.Detections.from_ultralytics(results)
-        detections = detections[detections.class_id == 0]
+        detections = pose_results.to_supervision()
 
         # Pass to ByteTrack
         tracked = byte_tracker.update_with_detections(detections)
@@ -144,30 +151,8 @@ def main():
             height = max(1e-5, tracked_bbox[3] - tracked_bbox[1])
             person_states[tracker_id]['bbox_ar'] = width / height
             
-            best_iou = 0
-            best_match_idx = -1
-            
-            if results.boxes is not None:
-                for k_idx, box in enumerate(results.boxes.xyxy.cpu().numpy()):
-                    x_left = max(tracked_bbox[0], box[0])
-                    y_top = max(tracked_bbox[1], box[1])
-                    x_right = min(tracked_bbox[2], box[2])
-                    y_bottom = min(tracked_bbox[3], box[3])
-                    
-                    if x_right < x_left or y_bottom < y_top:
-                        continue
-                        
-                    intersection = (x_right - x_left) * (y_bottom - y_top)
-                    area1 = (tracked_bbox[2] - tracked_bbox[0]) * (tracked_bbox[3] - tracked_bbox[1])
-                    area2 = (box[2] - box[0]) * (box[3] - box[1])
-                    iou = intersection / float(area1 + area2 - intersection)
-                    
-                    if iou > best_iou:
-                        best_iou = iou
-                        best_match_idx = k_idx
-                    
-            if best_match_idx != -1 and results.keypoints is not None:
-                kps = results.keypoints.data[best_match_idx].cpu().numpy()
+            kps = match_keypoints_to_bbox(pose_results, tracked_bbox)
+            if kps is not None:
                 update_person_state(tracker_id, kps, person_states[tracker_id])
 
             # Detect fall
@@ -280,24 +265,7 @@ def main():
                 cv2.putText(frame, text, (mx - 50, my), 
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 2)
                             
-        # Draw Fire and Weapons from custom model
-        if det_results.boxes is not None:
-            for box in det_results.boxes:
-                cls_id = int(box.cls[0].item())
-                if cls_id in [1, 2]:
-                    conf = float(box.conf[0].item())
-                    x1, y1, x2, y2 = map(int, box.xyxy[0].cpu().numpy())
-                    
-                    if cls_id == 1:
-                        label = f"FIRE WARNING {conf:.2f}"
-                        color = (0, 165, 255) # Orange (BGR)
-                    elif cls_id == 2:
-                        label = f"WEAPON DETECTED {conf:.2f}"
-                        color = (255, 0, 0) # Blue (BGR)
-                        
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
-                    cv2.putText(frame, label, (x1, max(0, y1 - 10)), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+        draw_object_detections(frame, det_results)
 
         # Live Preview
         cv2.imshow('Real-Time Webcam Pipeline', frame)
