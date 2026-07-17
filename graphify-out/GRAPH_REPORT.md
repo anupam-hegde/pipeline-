@@ -1,16 +1,16 @@
-# Graph Report - pipeline  (2026-07-08)
+# Graph Report - pipeline  (2026-07-17)
 
 ## Corpus Check
-- 19 files · ~61,461 words
+- 20 files · ~901,972 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
-- 239 nodes · 396 edges · 16 communities (11 shown, 5 thin omitted)
+- 242 nodes · 427 edges · 15 communities (10 shown, 5 thin omitted)
 - Extraction: 99% EXTRACTED · 1% INFERRED · 0% AMBIGUOUS · INFERRED: 3 edges (avg confidence: 0.6)
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `431ffbfc`
+- Built from commit: `40e392a6`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
@@ -21,7 +21,6 @@
 - Action Math & Violence Detection
 - FastAPI WebSocket & Webcam Server
 - Dataset Preparation & Directory Creation
-- Real-Time Tracking & State Management
 - Directory Video Testing & Extraction
 - Video Pose Extraction & Testing
 - Fall Detection & Emergency Monitoring
@@ -32,37 +31,37 @@
 - Project Python Dependencies
 
 ## God Nodes (most connected - your core abstractions)
-1. `PersonHistoryManager` - 15 edges
+1. `PersonHistoryManager` - 17 edges
 2. `detect_advanced_violence()` - 14 edges
-3. `PersonTrackHistory` - 12 edges
-4. `match_keypoints_to_bbox()` - 12 edges
-5. `detect_fall()` - 11 edges
-6. `ObjectDetectionBatch` - 11 edges
-7. `create_pose_pipeline()` - 11 edges
-8. `create_object_detector()` - 11 edges
-9. `extract_keypoint()` - 10 edges
-10. `draw_object_detections()` - 10 edges
+3. `detect_fall()` - 13 edges
+4. `create_pose_pipeline()` - 13 edges
+5. `create_object_detector()` - 13 edges
+6. `PersonTrackHistory` - 12 edges
+7. `ObjectDetectionBatch` - 12 edges
+8. `match_keypoints_to_bbox()` - 12 edges
+9. `main()` - 11 edges
+10. `extract_keypoint()` - 10 edges
 
 ## Surprising Connections (you probably didn't know these)
 - `main()` --calls--> `Exp`  [EXTRACTED]
   scripts/train_model.py → configs/yolox_surveillance.py
 - `export_and_verify()` --calls--> `Exp`  [EXTRACTED]
   scripts/export_onnx.py → configs/yolox_surveillance.py
+- `check_violence_between_pairs()` --calls--> `detect_advanced_violence()`  [EXTRACTED]
+  backend/main.py → backend/action_math.py
+- `check_falls()` --calls--> `detect_fall()`  [EXTRACTED]
+  backend/main.py → backend/action_math.py
 - `load_models()` --calls--> `CrowdCounter`  [EXTRACTED]
   backend/main.py → backend/crowd_counter.py
-- `load_models()` --calls--> `create_object_detector()`  [EXTRACTED]
-  backend/main.py → backend/vision_models.py
-- `load_models()` --calls--> `create_pose_pipeline()`  [EXTRACTED]
-  backend/main.py → backend/vision_models.py
 
 ## Import Cycles
 - None detected.
 
-## Communities (16 total, 5 thin omitted)
+## Communities (15 total, 5 thin omitted)
 
 ### Community 0 - "Vision Models & BBox Processing"
-Cohesion: 0.12
-Nodes (17): bbox_iou(), _decode_yolox_output(), _extract_bbox(), _extract_score(), _letterbox(), _nms(), _parse_pose_instances(), PoseDetectionBatch (+9 more)
+Cohesion: 0.18
+Nodes (7): _parse_pose_instances(), PoseDetectionBatch, Detections, Per-frame person detections with COCO-17 keypoints and optional ByteTrack IDs., Top-down RTMPose pipeline backed by the MMPose inferencer.      The default MMPo, RTMPosePipeline, _to_coco17_keypoints()
 
 ### Community 1 - "YOLOX Surveillance Configuration"
 Cohesion: 0.18
@@ -74,19 +73,15 @@ Nodes (22): convert_dataset_root(), convert_split_to_coco(), get_image_info(), m
 
 ### Community 3 - "Action Math & Violence Detection"
 Cohesion: 0.09
-Nodes (43): calculate_kinematics(), _cosine_similarity(), detect_advanced_violence(), detect_fall(), extract_keypoint(), _fill_missing(), ndarray, action_math.py — Advanced Kinematics Module for Violence Detection  Implements 3 (+35 more)
+Nodes (48): calculate_kinematics(), _cosine_similarity(), detect_advanced_violence(), detect_fall(), extract_keypoint(), _fill_missing(), ndarray, action_math.py — Production-Grade Kinematics Module for Violence & Fall Detectio (+40 more)
 
 ### Community 4 - "FastAPI WebSocket & Webcam Server"
-Cohesion: 0.12
-Nodes (17): CrowdDensityEstimator, DensityLevel, DensityMetrics, DensityThresholds, Detections, ndarray, Crowd density classification levels., Render a color-coded Crowd Density badge onto the video stream. (+9 more)
+Cohesion: 0.08
+Nodes (29): CrowdDensityEstimator, DensityLevel, DensityMetrics, DensityThresholds, Detections, ndarray, Crowd density classification levels., Render a color-coded Crowd Density badge onto the video stream. (+21 more)
 
 ### Community 5 - "Dataset Preparation & Directory Creation"
 Cohesion: 0.36
 Nodes (8): create_directories(), generate_yaml(), main(), process_dataset(), Path, Generates the data.yaml configuration file for YOLO training., Creates the YOLO directory structure inside OUTPUT_DIR., Scans a source dataset (either direct images/labels or split train/val/test fold
-
-### Community 6 - "Real-Time Tracking & State Management"
-Cohesion: 0.40
-Nodes (5): cleanup_stale_tracks(), Removes person_states entries that have been inactive for longer than timeout_se, Main WebSocket endpoint for real-time video processing.      Protocol:       1), video_websocket(), WebSocket
 
 ### Community 7 - "Directory Video Testing & Extraction"
 Cohesion: 0.08
@@ -108,17 +103,17 @@ Nodes (17): _compute_angle(), _extract_kp(), PersonHistoryManager, PersonTrackHi
 ## Suggested Questions
 _Questions this graph is uniquely positioned to answer:_
 
-- **Why does `PersonHistoryManager` connect `Fall Detection & Emergency Monitoring` to `Action Math & Violence Detection`?**
-  _High betweenness centrality (0.101) - this node is a cross-community bridge._
+- **Why does `PersonHistoryManager` connect `Fall Detection & Emergency Monitoring` to `Action Math & Violence Detection`, `FastAPI WebSocket & Webcam Server`?**
+  _High betweenness centrality (0.102) - this node is a cross-community bridge._
 - **Why does `CrowdCounter` connect `Video Pose Extraction & Testing` to `Action Math & Violence Detection`, `FastAPI WebSocket & Webcam Server`?**
   _High betweenness centrality (0.052) - this node is a cross-community bridge._
 - **Why does `CrowdDensityEstimator` connect `FastAPI WebSocket & Webcam Server` to `Action Math & Violence Detection`?**
   _High betweenness centrality (0.044) - this node is a cross-community bridge._
-- **What connects `action_math.py — Advanced Kinematics Module for Violence Detection  Implements 3`, `Applies Exponential Moving Average (EMA) smoothing to a sequence     of 2D keypo`, `Computes 1st through 3rd order kinematic derivatives from a     time-series of 2` to the rest of the system?**
-  _89 weakly-connected nodes found - possible documentation gaps or missing edges._
-- **Should `Vision Models & BBox Processing` be split into smaller, more focused modules?**
-  _Cohesion score 0.12169312169312169 - nodes in this community are weakly interconnected._
+- **What connects `action_math.py — Production-Grade Kinematics Module for Violence & Fall Detectio`, `Applies Exponential Moving Average (EMA) smoothing to a sequence     of 2D keypo`, `Computes 1st through 3rd order kinematic derivatives from a     time-series of 2` to the rest of the system?**
+  _90 weakly-connected nodes found - possible documentation gaps or missing edges._
 - **Should `YOLO to COCO Conversion` be split into smaller, more focused modules?**
   _Cohesion score 0.12666666666666668 - nodes in this community are weakly interconnected._
 - **Should `Action Math & Violence Detection` be split into smaller, more focused modules?**
-  _Cohesion score 0.08979591836734693 - nodes in this community are weakly interconnected._
+  _Cohesion score 0.08883693746347165 - nodes in this community are weakly interconnected._
+- **Should `FastAPI WebSocket & Webcam Server` be split into smaller, more focused modules?**
+  _Cohesion score 0.07899159663865546 - nodes in this community are weakly interconnected._

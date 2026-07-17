@@ -111,10 +111,11 @@ class RTMPosePipeline:
                 "Install the OpenMMLab dependencies from requirements.txt."
             ) from exc
 
+        effective_det_model = None if det_model in ("human", "default", None) else det_model
         self._inferencer = MMPoseInferencer(
             pose2d=pose_model,
             pose2d_weights=pose_weights,
-            det_model=det_model,
+            det_model=effective_det_model,
             det_weights=det_weights,
             det_cat_ids=list(det_cat_ids or [PERSON_CLASS_ID]),
             device=device,

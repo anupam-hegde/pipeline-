@@ -120,6 +120,12 @@ def main():
     })
 
     frame_idx = 0
+    peak_headcount = 0
+    total_unique_tracks = set()
+    fall_frames = 0
+    violence_frames = 0
+    fire_frames = 0
+    weapon_frames = 0
     print(f"[*] Starting processing loop for {total_frames} frames...")
 
     while cap.isOpened():
@@ -177,17 +183,19 @@ def main():
                 person_states[tracker_id]['fall_streak'] = 1
             elif person_states[tracker_id]['fall_streak'] > 0:
                 # They stopped dropping, but are they still on the ground?
-                is_wide = t_fall['ar'] > 1.0
+                # Use relaxed thresholds for sustain (vs. stricter initial trigger)
+                is_wide = t_fall['ar'] > 0.7
                 is_crumpled = t_fall['crumple'] < 0.25
-                if is_wide or is_crumpled:
+                is_leaning = t_fall.get('torso_lean', 0.0) > 60.0
+                if is_wide or is_crumpled or is_leaning:
                     person_states[tracker_id]['fall_streak'] += 1
                 else:
                     # Stood back up (e.g., tying shoe)
                     person_states[tracker_id]['fall_streak'] = 0
                     person_states[tracker_id]['is_fallen'] = False
 
-            # Trigger latch if they stay down for 10 frames
-            if person_states[tracker_id]['fall_streak'] > 10:
+            # Trigger latch if they stay down for 15 frames (~0.5s @30fps)
+            if person_states[tracker_id]['fall_streak'] > 15:
                 person_states[tracker_id]['is_fallen'] = True
             
             fall_telemetry[tracker_id] = {
@@ -232,8 +240,21 @@ def main():
                         'is_violence': is_violence
                     }
 
-        # 4. Visual Annotation Overlay
+        # 4. Visual Annotation Overlay & Analytics Update
         headcount = len(tracked)
+        peak_headcount = max(peak_headcount, headcount)
+        for idx in range(len(tracked)):
+            total_unique_tracks.add(int(tracked.tracker_id[idx]))
+
+        if any(f_telem['is_fall'] for f_telem in fall_telemetry.values()):
+            fall_frames += 1
+        if any(v_telem['is_violence'] for v_telem in violence_telemetry.values()):
+            violence_frames += 1
+        if any(int(cid) == 0 for cid in det_results.class_id):
+            fire_frames += 1
+        if any(int(cid) == 1 for cid in det_results.class_id):
+            weapon_frames += 1
+
         cv2.putText(frame, f"Headcount: {headcount}", (20, 40), 
                     cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
 
@@ -298,6 +319,15 @@ def main():
     out.release()
     cv2.destroyAllWindows()
     print(f"[*] Processing complete. Saved to {args.output}")
+    print("\n=================== VIDEO ANALYTICS SUMMARY ===================")
+    print(f"Total Frames Processed : {frame_idx}/{total_frames}")
+    print(f"Peak Active Headcount  : {peak_headcount}")
+    print(f"Total Unique Persons   : {len(total_unique_tracks)}")
+    print(f"Fall/Medical Emergency : Detected in {fall_frames} frames ({fall_frames/max(1, frame_idx)*100:.1f}%)")
+    print(f"Violence Detected      : Detected in {violence_frames} frames ({violence_frames/max(1, frame_idx)*100:.1f}%)")
+    print(f"Fire Warning Detected  : Detected in {fire_frames} frames ({fire_frames/max(1, frame_idx)*100:.1f}%)")
+    print(f"Weapon Detected        : Detected in {weapon_frames} frames ({weapon_frames/max(1, frame_idx)*100:.1f}%)")
+    print("===============================================================\n")
 
 if __name__ == "__main__":
     main()

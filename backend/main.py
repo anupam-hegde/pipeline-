@@ -290,17 +290,19 @@ def check_falls(current_time: float) -> Tuple[list, dict]:
             state['fall_streak'] = 1
         elif state['fall_streak'] > 0:
             # They stopped dropping, but are they still on the ground?
-            is_wide = telem['ar'] > 1.0
+            # Use relaxed thresholds for sustain
+            is_wide = telem['ar'] > 0.7
             is_crumpled = telem['crumple'] < 0.25
-            if is_wide or is_crumpled:
+            is_leaning = telem.get('torso_lean', 0.0) > 60.0
+            if is_wide or is_crumpled or is_leaning:
                 state['fall_streak'] += 1
             else:
                 # Stood back up
                 state['fall_streak'] = 0
                 state['is_fallen'] = False
 
-        # Trigger latch if they stay down for 10 frames
-        if state['fall_streak'] > 10:
+        # Trigger latch if they stay down for 15 frames (~0.5s @30fps)
+        if state['fall_streak'] > 15:
             state['is_fallen'] = True
 
         telemetry[tracker_id] = {

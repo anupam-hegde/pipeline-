@@ -92,10 +92,20 @@ def main():
     args.batch_size = 8       # Batch size 8 fits comfortably in 6 GB VRAM in FP16
     args.devices = 1
     args.fp16 = True          # Enable Automatic Mixed Precision (AMP)
-    args.ckpt = str(ckpt_path)
     args.logger = "tensorboard"
     args.occupy = False
     args.cache = False        # Disabled on Windows (no fork support)
+
+    # Check if a previous training run checkpoint exists to auto-resume without losing progress
+    latest_ckpt = models_dir / exp.experiment_name / "latest_ckpt.pth"
+    if latest_ckpt.exists():
+        print(f"[*] Found existing run checkpoint: {latest_ckpt.as_posix()}")
+        print("[*] Automatically enabling --resume from exactly where training left off!")
+        args.resume = True
+        args.ckpt = str(latest_ckpt)
+    else:
+        args.resume = False
+        args.ckpt = str(ckpt_path)
 
     print(f"[*] Experiment Name: {exp.experiment_name}")
     print(f"[*] Target Epochs:   {exp.max_epoch}")
