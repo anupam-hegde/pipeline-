@@ -139,9 +139,9 @@ class CrowdDensityEstimator:
         self, 
         frame: np.ndarray, 
         metrics: Optional[DensityMetrics] = None,
-        position: Tuple[int, int] = (20, 145)
+        position: Tuple[int, int] = (15, 80)
     ) -> np.ndarray:
-        """Render a color-coded Crowd Density badge onto the video stream."""
+        """Render a compact, color-coded Crowd Density badge onto the video stream."""
         if metrics is None:
             metrics = self._last_metrics
         if metrics is None:
@@ -157,31 +157,30 @@ class CrowdDensityEstimator:
         }
         active_color = colors.get(metrics.level, (255, 255, 255))
 
+        hud_width = 186
+        hud_height = 58 if metrics.level == DensityLevel.HIGH else 42
+
         # Render Background Panel
         overlay = frame.copy()
-        cv2.rectangle(overlay, (x - 10, y - 20), (x + 280, y + 65), (15, 23, 42), -1)
+        cv2.rectangle(overlay, (x - 6, y - 16), (x - 6 + hud_width, y - 16 + hud_height), (15, 23, 42), -1)
         cv2.addWeighted(overlay, 0.8, frame, 0.2, 0, frame)
-        cv2.rectangle(frame, (x - 10, y - 20), (x + 280, y + 65), active_color, 2)
+        cv2.rectangle(frame, (x - 6, y - 16), (x - 6 + hud_width, y - 16 + hud_height), active_color, 1)
 
-        # Draw Level Badge & Telemetry
+        # Draw Level Badge & Telemetry (compact 2 lines)
         cv2.putText(
             frame, f"DENSITY: {metrics.level.value}", 
-            (x, y + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.7, active_color, 2
+            (x, y + 2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, active_color, 1
         )
         cv2.putText(
-            frame, f"Occupied Area: {metrics.occupied_area_ratio * 100:.1f}%", 
-            (x, y + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (230, 230, 230), 1
-        )
-        cv2.putText(
-            frame, f"Active Tracks: {metrics.active_person_count} persons", 
-            (x, y + 50), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1
+            frame, f"Area: {metrics.occupied_area_ratio * 100:.1f}% | Tracks: {metrics.active_person_count}", 
+            (x, y + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (220, 220, 220), 1
         )
 
-        # Draw Visual Warning Banner on High Density / Overcrowding
+        # Draw Compact Warning Line if High Density
         if metrics.level == DensityLevel.HIGH:
             cv2.putText(
-                frame, "WARNING: HIGH CROWD DENSITY DETECTED", 
-                (x, max(30, y - 35)), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 255), 2
+                frame, "HIGH DENSITY DETECTED", 
+                (x, y + 36), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 0, 255), 1
             )
 
         return frame

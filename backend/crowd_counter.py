@@ -98,9 +98,9 @@ class CrowdCounter:
         self, 
         frame: np.ndarray, 
         metrics: Optional[CrowdMetrics] = None,
-        position: Tuple[int, int] = (20, 40)
+        position: Tuple[int, int] = (15, 25)
     ) -> np.ndarray:
-        """Render a high-visibility Crowd Analytics HUD onto the frame."""
+        """Render a compact, high-visibility Crowd Analytics HUD onto the frame."""
         if metrics is None:
             metrics = CrowdMetrics(
                 current_count=len(self._active_ids),
@@ -110,28 +110,24 @@ class CrowdCounter:
             )
 
         x, y = position
-        hud_width, hud_height = 280, 90
+        hud_width, hud_height = 186, 42
 
         # Draw semi-transparent dark background overlay for readability
         overlay = frame.copy()
-        cv2.rectangle(overlay, (x - 10, y - 25), (x + hud_width, y + hud_height), (15, 23, 42), -1)
-        cv2.addWeighted(overlay, 0.75, frame, 0.25, 0, frame)
+        cv2.rectangle(overlay, (x - 6, y - 16), (x - 6 + hud_width, y - 16 + hud_height), (15, 23, 42), -1)
+        cv2.addWeighted(overlay, 0.8, frame, 0.2, 0, frame)
 
         # Draw border highlight
-        cv2.rectangle(frame, (x - 10, y - 25), (x + hud_width, y + hud_height), (56, 189, 248), 2)
+        cv2.rectangle(frame, (x - 6, y - 16), (x - 6 + hud_width, y - 16 + hud_height), (56, 189, 248), 1)
 
-        # Render Metrics Typography
+        # Render Metrics Typography (compact 2 lines)
         cv2.putText(
-            frame, f"ACTIVE CROWD: {metrics.current_count}", 
-            (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2
+            frame, f"CROWD: {metrics.current_count}", 
+            (x, y + 2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (74, 222, 128), 1
         )
         cv2.putText(
-            frame, f"Peak Occupancy: {metrics.peak_count}", 
-            (x, y + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1
-        )
-        cv2.putText(
-            frame, f"Total Unique Visitors: {metrics.cumulative_count}", 
-            (x, y + 55), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1
+            frame, f"Peak: {metrics.peak_count} | Total: {metrics.cumulative_count}", 
+            (x, y + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (220, 220, 220), 1
         )
 
         return frame

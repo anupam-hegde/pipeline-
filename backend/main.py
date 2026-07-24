@@ -31,16 +31,22 @@ from fastapi.middleware.cors import CORSMiddleware
 from backend.action_math import (
     detect_advanced_violence,
     detect_fall,
+    detect_immobility,
     extract_keypoint,
+    SEVERITY_ESCALATION_MEDICAL,
+    SEVERITY_ESCALATION_CRITICAL,
 )
 from backend.vision_models import (
     create_object_detector,
     create_pose_pipeline,
+    draw_object_detections,
     match_keypoints_to_bbox,
+    ObjectDetectionBatch,
 )
 from backend.crowd_counter import CrowdCounter
 from backend.crowd_density import CrowdDensityEstimator, DensityThresholds
 from backend.history_manager import PersonHistoryManager
+from backend.medical_emergency_analyzer import MedicalEmergencyAnalyzer, RuleEvaluationReport
 
 # ============================================================
 # CONFIGURABLE CONSTANTS
@@ -128,6 +134,7 @@ detection_model = None
 byte_tracker = None
 crowd_counter = None
 crowd_density_estimator = None
+medical_analyzer = None
 
 
 # ============================================================
@@ -140,7 +147,7 @@ def load_models():
     if model files are not yet present (fails on first request
     with a clear error instead of on import).
     """
-    global pose_model, detection_model, byte_tracker, crowd_counter, crowd_density_estimator
+    global pose_model, detection_model, byte_tracker, crowd_counter, crowd_density_estimator, medical_analyzer
 
     if pose_model is None:
         try:
@@ -151,7 +158,7 @@ def load_models():
 
             detection_model = create_object_detector()
             if detection_model is not None:
-                print("[*] YOLOX custom object detector loaded successfully.")
+                print("[*] ONNX object detector loaded successfully.")
 
             # ByteTrack tracker from supervision library
             byte_tracker = sv.ByteTrack(
@@ -171,7 +178,8 @@ def load_models():
                     high_person_count=12,
                 )
             )
-            print("[*] Crowd analytics modules initialized.")
+            medical_analyzer = MedicalEmergencyAnalyzer()
+            print("[*] Crowd analytics & MedicalEmergencyAnalyzer modules initialized.")
 
         except Exception as e:
             print(f"[!] Error loading models: {e}")
@@ -260,56 +268,41 @@ def check_violence_between_pairs(current_time: float) -> Tuple[list, dict]:
 
 
 # ============================================================
-# FALL CHECK
+# FALL CHECK (Production-Ready Medical Emergency Analyzer)
 # ============================================================
-def check_falls(current_time: float) -> Tuple[list, dict]:
+def check_falls(current_time: float, tracked_pose: Optional[Any] = None) -> Tuple[list, dict]:
     """
-    Checks every tracked person for a fall event using the
-    head velocity + torso angle heuristic.
-
-    Args:
-        current_time: time.time() value for cooldown comparisons.
-
-    Returns:
-        Tuple of (alerts_list, telemetry_dict)
+    Checks every tracked person for fall events using the rule-based
+    MedicalEmergencyAnalyzer with 10 biomechanical/kinematic checks and
+    calibrated confidence tiers (0-100).
     """
     alerts = []
     telemetry = {}
 
-    for tracker_id, state in person_states.items():
-        # --- Convert deques to lists ---
-        history = {k: list(v) for k, v in state.items() if isinstance(v, deque)}
+    if medical_analyzer is None or tracked_pose is None or len(tracked_pose) == 0:
+        if medical_analyzer is not None:
+            active_ids = set(history_manager.keys())
+            medical_analyzer.prune_stale_tracks(active_ids)
+        return alerts, telemetry
 
-        width = state.get('bbox_width', 1.0)
-        height = state.get('bbox_height', 1.0)
-        is_fall_now, telem = detect_fall(history, width, height)
-        
-        # --- TEMPORAL DEBOUNCE LOGIC ---
-        if is_fall_now:
-            # Sudden drop + wide/crumpled detected
-            state['fall_streak'] = 1
-        elif state['fall_streak'] > 0:
-            # They stopped dropping, but are they still on the ground?
-            # Use relaxed thresholds for sustain
-            is_wide = telem['ar'] > 0.7
-            is_crumpled = telem['crumple'] < 0.25
-            is_leaning = telem.get('torso_lean', 0.0) > 60.0
-            if is_wide or is_crumpled or is_leaning:
-                state['fall_streak'] += 1
-            else:
-                # Stood back up
-                state['fall_streak'] = 0
-                state['is_fallen'] = False
+    for idx in range(len(tracked_pose)):
+        if tracked_pose.tracker_id is None:
+            continue
+        tracker_id = int(tracked_pose.tracker_id[idx])
+        bbox = tracked_pose.xyxy[idx].tolist()
+        keypoints = tracked_pose.keypoints[idx]
 
-        # Trigger latch if they stay down for 15 frames (~0.5s @30fps)
-        if state['fall_streak'] > 15:
-            state['is_fallen'] = True
+        report = medical_analyzer.analyze(tracker_id, bbox, keypoints, current_time)
 
         telemetry[tracker_id] = {
-            'dy_norm': telem['dy_norm'],
-            'ar': telem['ar'],
-            'crumple': telem['crumple'],
-            'is_fall': state['is_fallen']
+            'dy_norm': report.rule_scores.get('rule_1_rapid_descent', 0.0),
+            'ar': report.rule_scores.get('rule_3_aspect_ratio_lying', 0.0),
+            'crumple': report.rule_scores.get('rule_4_hip_shoulder_alignment', 0.0),
+            'torso_lean': report.rule_scores.get('rule_2_torso_horizontal', 0.0),
+            'confidence': report.confidence_score,
+            'severity': report.confidence_level,
+            'time_on_ground': report.immobile_duration_sec,
+            'is_fall': report.is_fallen,
         }
 
         # --- Cooldown gate ---
@@ -317,16 +310,22 @@ def check_falls(current_time: float) -> Tuple[list, dict]:
         if current_time - last_alert < FALL_ALERT_COOLDOWN:
             continue
 
-        if state['is_fallen']:
+        # Send alerts for HIGH_PROBABILITY_FALL and MEDICAL_EMERGENCY
+        if report.confidence_level in ("HIGH_PROBABILITY_FALL", "MEDICAL_EMERGENCY"):
             fall_cooldowns[tracker_id] = current_time
             alerts.append({
                 'type': 'fall',
-                'severity': 'MEDICAL EMERGENCY',
+                'severity': report.confidence_level,
+                'confidence': report.confidence_score,
+                'time_on_ground': round(report.immobile_duration_sec, 1),
                 'person_id': int(tracker_id),
                 'timestamp': current_time,
             })
-            print(f"[ALERT] MEDICAL EMERGENCY (Fall detected): Person {tracker_id}")
+            print(f"[ALERT] {report.confidence_level}: Person {tracker_id} "
+                  f"(confidence={report.confidence_score:.1f}, on_ground={report.immobile_duration_sec:.1f}s)")
 
+    active_ids = set(history_manager.keys())
+    medical_analyzer.prune_stale_tracks(active_ids)
     return alerts, telemetry
 
 
@@ -342,6 +341,8 @@ def cleanup_stale_tracks(current_time: float):
     for tid in stale_ids:
         violence_cooldowns.pop(frozenset({tid}), None)
         fall_cooldowns.pop(tid, None)
+        if medical_analyzer is not None and tid in medical_analyzer.track_histories:
+            del medical_analyzer.track_histories[tid]
 
 
 # ============================================================
@@ -398,6 +399,13 @@ async def video_websocket(websocket: WebSocket):
             sv_detections = raw_pose.to_supervision()
             tracked = byte_tracker.update_with_detections(sv_detections)
 
+            # --- Run ONNX object detection (Fire / Smoke / Weapon) ---
+            det_results = (
+                detection_model.predict(frame, confidence=0.45)
+                if detection_model is not None
+                else ObjectDetectionBatch.empty()
+            )
+
             # --- Update Crowd Counting and Density Estimation ---
             if crowd_counter is not None:
                 crowd_metrics = crowd_counter.update(tracked, current_time=current_time)
@@ -441,8 +449,25 @@ async def video_websocket(websocket: WebSocket):
 
             # --- Run behavior analysis ---
             violence_alerts, violence_telemetry = check_violence_between_pairs(current_time)
-            fall_alerts, fall_telemetry = check_falls(current_time)
+            fall_alerts, fall_telemetry = check_falls(current_time, tracked_pose if len(tracked) > 0 else None)
             all_alerts = violence_alerts + fall_alerts
+
+            # --- Check for Fire / Smoke detections from ONNX detector ---
+            for bbox, score, cid in zip(det_results.xyxy, det_results.confidence, det_results.class_id):
+                if int(cid) == 0:
+                    all_alerts.append({
+                        'type': 'FIRE',
+                        'confidence': float(score),
+                        'bbox': bbox.tolist(),
+                        'timestamp': current_time,
+                    })
+                elif int(cid) == 2:
+                    all_alerts.append({
+                        'type': 'SMOKE',
+                        'confidence': float(score),
+                        'bbox': bbox.tolist(),
+                        'timestamp': current_time,
+                    })
 
             # --- Render Telemetry & Bounding Boxes ---
             red_boxes = set()
@@ -457,14 +482,34 @@ async def video_websocket(websocket: WebSocket):
                 tid = det['tracker_id']
                 x1, y1, x2, y2 = map(int, det['bbox'])
 
-                # Determine color: BGR format
-                color = (0, 0, 255) if tid in red_boxes else (0, 255, 0)
-
-                # Determine label text based on event detection
-                label = "Normal"
+                # Determine color based on severity: BGR format
                 f_telem = fall_telemetry.get(tid)
-                if f_telem and f_telem['is_fall']:
-                    label = "MEDICAL EMERGENCY"
+                severity = f_telem.get('severity', 'NONE') if f_telem else 'NONE'
+                is_down = f_telem.get('is_fall', False) if f_telem else False
+
+                if severity in ('CRITICAL_EMERGENCY', 'MEDICAL_EMERGENCY') or is_down:
+                    color = (0, 0, 255)       # Bright red — medical emergency
+                elif severity in ('HIGH_PROBABILITY_FALL', 'FALL_DETECTED'):
+                    color = (0, 140, 255)     # Orange — high probability fall
+                elif severity == 'POSSIBLE_FALL':
+                    color = (0, 165, 255)     # Light orange — possible fall
+                elif tid in red_boxes:
+                    color = (0, 0, 255)       # Red — violence
+                else:
+                    color = (0, 255, 0)       # Green — normal
+
+                # Determine label text based on severity
+                label = "Normal"
+                if severity in ('CRITICAL_EMERGENCY', 'MEDICAL_EMERGENCY') or is_down:
+                    tog = f_telem.get('time_on_ground', 0.0) if f_telem else 0.0
+                    conf = f_telem.get('confidence', 0.0) if f_telem else 0.0
+                    label = f"MEDICAL EMERGENCY ({tog:.1f}s)" if tog > 0 else f"MEDICAL EMERGENCY ({conf:.0f}%)"
+                elif severity in ('HIGH_PROBABILITY_FALL', 'FALL_DETECTED'):
+                    conf = f_telem.get('confidence', 0.0) if f_telem else 0.0
+                    label = f"HIGH PROBABILITY FALL ({conf:.0f}%)"
+                elif severity == 'POSSIBLE_FALL':
+                    conf = f_telem.get('confidence', 0.0) if f_telem else 0.0
+                    label = f"POSSIBLE FALL ({conf:.0f}%)"
                 else:
                     for pair, v_telem in violence_telemetry.items():
                         if tid in pair and v_telem['is_violence']:
@@ -476,10 +521,11 @@ async def video_websocket(websocket: WebSocket):
                 cv2.putText(frame, label, (x1, max(0, y1 - 10)), 
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-                # Draw Fall Telemetry
-                f_telem = fall_telemetry.get(tid)
+                # Draw Fall Telemetry (enriched with confidence + severity)
                 if f_telem:
-                    text = f"Drop: {f_telem['dy_norm']:.2f} | AR: {f_telem['ar']:.1f} | Crump: {f_telem['crumple']:.2f}"
+                    conf = f_telem.get('confidence', 0.0)
+                    text = (f"Drop: {f_telem['dy_norm']:.2f} | AR: {f_telem['ar']:.1f} "
+                            f"| Crump: {f_telem['crumple']:.2f} | Conf: {conf:.2f}")
                     # Display blue text below the box
                     cv2.putText(frame, text, (x1, y2 + 20), 
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
@@ -499,11 +545,14 @@ async def video_websocket(websocket: WebSocket):
                         cv2.putText(frame, text, (mx - 50, my), 
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 2)
 
+            # --- Draw ONNX Object Detections (Fire/Smoke/Weapon) ---
+            draw_object_detections(frame, det_results)
+
             # --- Draw Crowd Analytics Overlays ---
             if crowd_counter is not None and crowd_metrics is not None:
-                crowd_counter.draw_hud(frame, metrics=crowd_metrics, position=(20, 40))
+                crowd_counter.draw_hud(frame, metrics=crowd_metrics, position=(15, 25))
             if crowd_density_estimator is not None and density_metrics is not None:
-                crowd_density_estimator.draw_hud(frame, metrics=density_metrics, position=(20, 145))
+                crowd_density_estimator.draw_hud(frame, metrics=density_metrics, position=(15, 80))
 
             # --- Encode modified frame to base64 ---
             _, buffer = cv2.imencode('.jpg', frame)
@@ -549,6 +598,7 @@ async def health_check():
         "status": "healthy",
         "tracked_persons": len(person_states),
         "models_loaded": pose_model is not None,
+        "object_detector_loaded": detection_model is not None,
     }
 
 

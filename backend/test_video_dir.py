@@ -1,6 +1,7 @@
 import os
 import sys
 import argparse
+import time
 from collections import defaultdict, deque
 
 import cv2
@@ -13,7 +14,9 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from backend.action_math import (
     detect_advanced_violence,
     detect_fall,
+    detect_immobility,
     extract_keypoint,
+    SEVERITY_ESCALATION_CRITICAL,
 )
 from backend.vision_models import (
     ObjectDetectionBatch,
@@ -22,6 +25,7 @@ from backend.vision_models import (
     draw_object_detections,
     match_keypoints_to_bbox,
 )
+from backend.medical_emergency_analyzer import MedicalEmergencyAnalyzer
 
 # Constants
 HISTORY_LENGTH = 15
@@ -120,7 +124,12 @@ def main():
             'fall_streak': 0,
             'is_fallen': False,
             'bbox_ar': 1.0,
+            'fall_onset_time': None,
+            'immobility_start': None,
+            'peak_severity': 'NONE',
+            'fall_confidence': 0.0,
         })
+        medical_analyzer = MedicalEmergencyAnalyzer()
 
         while True:
             ret, frame = cap.read()
@@ -169,43 +178,29 @@ def main():
                 kps = match_keypoints_to_bbox(pose_results, tracked_bbox)
                 if kps is not None:
                     update_person_state(tracker_id, kps, person_states[tracker_id])
+                else:
+                    kps = np.zeros((17, 2), dtype=np.float32)
 
-                # Detect fall
-                history = {k: list(v) for k, v in person_states[tracker_id].items() if isinstance(v, deque)}
-                is_fall_now, t_fall = detect_fall(history, width, height)
-                
-                # --- TEMPORAL DEBOUNCE LOGIC ---
-                if is_fall_now:
-                    # Sudden drop + wide/crumpled detected
-                    person_states[tracker_id]['fall_streak'] = 1
-                elif person_states[tracker_id]['fall_streak'] > 0:
-                    # They stopped dropping, but are they still on the ground?
-                    is_wide = t_fall['ar'] > 1.0
-                    is_crumpled = t_fall['crumple'] < 0.25
-                    if is_wide or is_crumpled:
-                        person_states[tracker_id]['fall_streak'] += 1
-                    else:
-                        # Stood back up (e.g., tying shoe)
-                        person_states[tracker_id]['fall_streak'] = 0
-                        person_states[tracker_id]['is_fallen'] = False
+                # Run 10-Rule Medical Emergency Analyzer
+                report = medical_analyzer.analyze(tracker_id, tracked_bbox.tolist(), kps, time.time())
 
-                # Trigger latch if they stay down for 10 frames
-                if person_states[tracker_id]['fall_streak'] > 10:
-                    person_states[tracker_id]['is_fallen'] = True
-                    
                 fall_telemetry[tracker_id] = {
-                    'dy_norm': t_fall['dy_norm'],
-                    'ar': t_fall['ar'],
-                    'crumple': t_fall['crumple'],
-                    'is_fall': person_states[tracker_id]['is_fallen']
+                    'dy_norm': report.rule_scores.get('rule_1_rapid_descent', 0.0),
+                    'ar': report.rule_scores.get('rule_3_aspect_ratio_lying', 0.0),
+                    'crumple': report.rule_scores.get('rule_4_hip_shoulder_alignment', 0.0),
+                    'confidence': report.confidence_score,
+                    'severity': report.confidence_level,
+                    'time_on_ground': report.immobile_duration_sec,
+                    'is_fall': report.is_fallen
                 }
-                if person_states[tracker_id]['is_fallen']:
+                if report.confidence_level in ("HIGH_PROBABILITY_FALL", "MEDICAL_EMERGENCY") or report.is_fallen:
                     red_boxes.add(tracker_id)
 
             # Cleanup stale tracks
             stale_ids = [tid for tid in person_states if tid not in active_tracker_ids]
             for tid in stale_ids:
                 del person_states[tid]
+            medical_analyzer.prune_stale_tracks(active_tracker_ids)
 
             # Calculate proximity & run advanced violence
             tracked_ids = list(person_states.keys())
@@ -244,14 +239,35 @@ def main():
                 tid = int(tracked.tracker_id[idx])
                 x1, y1, x2, y2 = map(int, tracked.xyxy[idx])
                 
-                color = (0, 0, 255) if tid in red_boxes else (0, 255, 0)
+                f_telem = fall_telemetry.get(tid)
+                severity = f_telem.get('severity', 'NONE') if f_telem else 'NONE'
+                is_down = f_telem.get('is_fall', False) if f_telem else False
+
+                if severity in ('CRITICAL_EMERGENCY', 'MEDICAL_EMERGENCY') or is_down:
+                    color = (0, 0, 255)
+                elif severity in ('HIGH_PROBABILITY_FALL', 'FALL_DETECTED'):
+                    color = (0, 140, 255)
+                elif severity == 'POSSIBLE_FALL':
+                    color = (0, 165, 255)
+                elif tid in red_boxes:
+                    color = (0, 0, 255)
+                else:
+                    color = (0, 255, 0)
                 
                 # Determine label text
                 label = "Normal"
-                f_telem = fall_telemetry.get(tid)
-                if f_telem and f_telem['is_fall']:
-                    label = "MEDICAL EMERGENCY"
-                    print(f"[!] ALERT: MEDICAL EMERGENCY (Fall) detected for Person ID {tid}!")
+                if severity in ('CRITICAL_EMERGENCY', 'MEDICAL_EMERGENCY') or is_down:
+                    tog = f_telem.get('time_on_ground', 0.0) if f_telem else 0.0
+                    conf = f_telem.get('confidence', 0.0) if f_telem else 0.0
+                    label = f"MEDICAL EMERGENCY ({tog:.1f}s)" if tog > 0 else f"MEDICAL EMERGENCY ({conf:.0f}%)"
+                    if tog == 0 or int(tog * 10) % 20 == 0:
+                        print(f"[!] ALERT: MEDICAL EMERGENCY detected for Person ID {tid} (Score: {conf:.0f}%, Time: {tog:.1f}s)!")
+                elif severity in ('HIGH_PROBABILITY_FALL', 'FALL_DETECTED'):
+                    conf = f_telem.get('confidence', 0.0) if f_telem else 0.0
+                    label = f"HIGH PROBABILITY FALL ({conf:.0f}%)"
+                elif severity == 'POSSIBLE_FALL':
+                    conf = f_telem.get('confidence', 0.0) if f_telem else 0.0
+                    label = f"POSSIBLE FALL ({conf:.0f}%)"
                 else:
                     for pair, v_telem in violence_telemetry.items():
                         if tid in pair and v_telem['is_violence']:
@@ -266,7 +282,8 @@ def main():
                 
                 # Burn Fall Telemetry
                 if f_telem:
-                    text = f"Drop: {f_telem['dy_norm']:.2f} | AR: {f_telem['ar']:.1f} | Crump: {f_telem['crumple']:.2f}"
+                    conf = f_telem.get('confidence', 0.0)
+                    text = f"Drop: {f_telem['dy_norm']:.2f} | AR: {f_telem['ar']:.1f} | Crump: {f_telem['crumple']:.2f} | Conf: {conf:.2f}"
                     cv2.putText(frame, text, (x1, y2 + 20), 
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
                                 

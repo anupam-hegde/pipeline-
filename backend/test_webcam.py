@@ -14,6 +14,8 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from backend.action_math import (
     detect_advanced_violence,
     detect_fall,
+    detect_immobility,
+    SEVERITY_ESCALATION_CRITICAL,
 )
 from backend.vision_models import (
     ObjectDetectionBatch,
@@ -24,6 +26,7 @@ from backend.vision_models import (
 from backend.crowd_counter import CrowdCounter
 from backend.crowd_density import CrowdDensityEstimator, DensityThresholds
 from backend.history_manager import PersonHistoryManager
+from backend.medical_emergency_analyzer import MedicalEmergencyAnalyzer
 
 # Constants
 HISTORY_LENGTH = 15
@@ -63,6 +66,7 @@ def main():
         )
     )
     history_manager = PersonHistoryManager(history_length=HISTORY_LENGTH, timeout_seconds=15.0)
+    medical_analyzer = MedicalEmergencyAnalyzer()
 
     print(f"[*] Opening Camera {args.camera}...")
     cap = cv2.VideoCapture(args.camera)
@@ -128,44 +132,26 @@ def main():
                 kps = tracked_pose.keypoints[idx]
 
                 # Update PersonHistoryManager
-                track_state = history_manager.update(tracker_id, bbox, kps, current_time)
+                history_manager.update(tracker_id, bbox, kps, current_time)
 
-                # Detect fall
-                history = {k: list(v) for k, v in track_state.items() if isinstance(v, deque)}
-                is_fall_now, t_fall = detect_fall(
-                    history,
-                    track_state.get('bbox_width', 1.0),
-                    track_state.get('bbox_height', 1.0),
-                )
-
-                # Temporal Debounce Logic
-                if is_fall_now:
-                    track_state['fall_streak'] = 1
-                elif track_state['fall_streak'] > 0:
-                    # Use relaxed thresholds for sustain
-                    is_wide = t_fall['ar'] > 0.7
-                    is_crumpled = t_fall['crumple'] < 0.25
-                    is_leaning = t_fall.get('torso_lean', 0.0) > 60.0
-                    if is_wide or is_crumpled or is_leaning:
-                        track_state['fall_streak'] += 1
-                    else:
-                        track_state['fall_streak'] = 0
-                        track_state['is_fallen'] = False
-
-                if track_state['fall_streak'] > 15:
-                    track_state['is_fallen'] = True
+                # Run 10-Rule Medical Emergency Analyzer
+                report = medical_analyzer.analyze(tracker_id, bbox, kps, current_time)
 
                 fall_telemetry[tracker_id] = {
-                    'dy_norm': t_fall['dy_norm'],
-                    'ar': t_fall['ar'],
-                    'crumple': t_fall['crumple'],
-                    'is_fall': track_state['is_fallen'],
+                    'dy_norm': report.rule_scores.get('rule_1_rapid_descent', 0.0),
+                    'ar': report.rule_scores.get('rule_3_aspect_ratio_lying', 0.0),
+                    'crumple': report.rule_scores.get('rule_4_hip_shoulder_alignment', 0.0),
+                    'confidence': report.confidence_score,
+                    'severity': report.confidence_level,
+                    'time_on_ground': report.immobile_duration_sec,
+                    'is_fall': report.is_fallen,
                 }
-                if track_state['is_fallen']:
+                if report.confidence_level in ("HIGH_PROBABILITY_FALL", "MEDICAL_EMERGENCY") or report.is_fallen:
                     red_boxes.add(tracker_id)
 
         # Cleanup stale tracks
         history_manager.cleanup_inactive(current_time)
+        medical_analyzer.prune_stale_tracks(active_tracker_ids)
 
         # Calculate proximity & run advanced violence
         tracked_ids = list(history_manager.keys())
@@ -206,12 +192,32 @@ def main():
                 tid = int(tracked_pose.tracker_id[idx])
                 x1, y1, x2, y2 = map(int, tracked_pose.xyxy[idx])
 
-                color = (0, 0, 255) if tid in red_boxes else (0, 255, 0)
+                f_telem = fall_telemetry.get(tid)
+                severity = f_telem.get('severity', 'NONE') if f_telem else 'NONE'
+                is_down = f_telem.get('is_fall', False) if f_telem else False
+
+                if severity in ('CRITICAL_EMERGENCY', 'MEDICAL_EMERGENCY') or is_down:
+                    color = (0, 0, 255)
+                elif severity in ('HIGH_PROBABILITY_FALL', 'FALL_DETECTED'):
+                    color = (0, 140, 255)
+                elif severity == 'POSSIBLE_FALL':
+                    color = (0, 165, 255)
+                elif tid in red_boxes:
+                    color = (0, 0, 255)
+                else:
+                    color = (0, 255, 0)
 
                 label = "Normal"
-                f_telem = fall_telemetry.get(tid)
-                if f_telem and f_telem['is_fall']:
-                    label = "MEDICAL EMERGENCY"
+                if severity in ('CRITICAL_EMERGENCY', 'MEDICAL_EMERGENCY') or is_down:
+                    tog = f_telem.get('time_on_ground', 0.0) if f_telem else 0.0
+                    conf = f_telem.get('confidence', 0.0) if f_telem else 0.0
+                    label = f"MEDICAL EMERGENCY ({tog:.1f}s)" if tog > 0 else f"MEDICAL EMERGENCY ({conf:.0f}%)"
+                elif severity in ('HIGH_PROBABILITY_FALL', 'FALL_DETECTED'):
+                    conf = f_telem.get('confidence', 0.0) if f_telem else 0.0
+                    label = f"HIGH PROBABILITY FALL ({conf:.0f}%)"
+                elif severity == 'POSSIBLE_FALL':
+                    conf = f_telem.get('confidence', 0.0) if f_telem else 0.0
+                    label = f"POSSIBLE FALL ({conf:.0f}%)"
                 else:
                     for pair, v_telem in violence_telemetry.items():
                         if tid in pair and v_telem['is_violence']:
@@ -230,7 +236,8 @@ def main():
                 )
 
                 if f_telem:
-                    text = f"Drop: {f_telem['dy_norm']:.2f} | AR: {f_telem['ar']:.1f} | Crump: {f_telem['crumple']:.2f}"
+                    conf = f_telem.get('confidence', 0.0)
+                    text = f"Drop: {f_telem['dy_norm']:.2f} | AR: {f_telem['ar']:.1f} | Crump: {f_telem['crumple']:.2f} | Conf: {conf:.2f}"
                     cv2.putText(
                         frame,
                         text,
@@ -263,8 +270,8 @@ def main():
         draw_object_detections(frame, det_results)
 
         # Draw Crowd Analytics HUD Overlays
-        crowd_counter.draw_hud(frame, metrics=crowd_metrics, position=(20, 40))
-        crowd_density_estimator.draw_hud(frame, metrics=density_metrics, position=(20, 145))
+        crowd_counter.draw_hud(frame, metrics=crowd_metrics, position=(15, 25))
+        crowd_density_estimator.draw_hud(frame, metrics=density_metrics, position=(15, 80))
 
         # Live Preview
         cv2.imshow('Real-Time Surveillance Pipeline - Live Webcam', frame)

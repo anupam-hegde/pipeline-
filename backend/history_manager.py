@@ -97,6 +97,13 @@ class PersonTrackHistory:
         self.fall_streak: int = 0
         self.is_fallen: bool = False
 
+        # Medical emergency severity escalation state
+        # Tracks: NONE → FALL_DETECTED → MEDICAL_EMERGENCY → CRITICAL_EMERGENCY
+        self.fall_onset_time: Optional[float] = None     # timestamp when fall first confirmed
+        self.immobility_start: Optional[float] = None    # timestamp when centroid stopped moving
+        self.peak_severity: str = "NONE"                 # highest severity reached (never de-escalates)
+        self.fall_confidence: float = 0.0                # latest weighted confidence score from detect_fall
+
     def update(self, bbox: list[float], keypoints: np.ndarray, timestamp: float) -> None:
         """Update historical buffers with new frame detections and compute derived kinematics."""
         prev_time = self.timestamps[-1] if self.timestamps else timestamp
@@ -191,6 +198,11 @@ class PersonTrackHistory:
             'bbox_ar': ar,
             'bbox_width': w,
             'bbox_height': h,
+            # Medical emergency severity escalation fields
+            'fall_onset_time': self.fall_onset_time,
+            'immobility_start': self.immobility_start,
+            'peak_severity': self.peak_severity,
+            'fall_confidence': self.fall_confidence,
         }
         return state_dict
 
@@ -210,6 +222,14 @@ class PersonTrackHistory:
             self.is_fallen = value
         elif key == 'centroid':
             self.centroid = value
+        elif key == 'fall_onset_time':
+            self.fall_onset_time = value
+        elif key == 'immobility_start':
+            self.immobility_start = value
+        elif key == 'peak_severity':
+            self.peak_severity = value
+        elif key == 'fall_confidence':
+            self.fall_confidence = value
 
 
 

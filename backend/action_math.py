@@ -127,6 +127,43 @@ FALL_AR_THRESHOLD = 0.85
 # Set at 60° to avoid catching minor leaning (30–50°).
 FALL_TORSO_LEAN_THRESHOLD = 60.0
 
+# --- Weighted Confidence Scoring for Fall Detection ---
+# Mirrors the proven violence detection pattern. Each signal contributes
+# a weight to a total confidence score. A fall is flagged when the
+# combined score >= FALL_CONFIDENCE_THRESHOLD.
+#
+# Rationale for lower threshold (0.55 vs violence's 0.65):
+#   Falls are medical emergencies — false negatives are more dangerous
+#   than false positives. We accept slightly higher FP rate to ensure
+#   real falls are never missed.
+FALL_WEIGHT_HEAD_DROP     = 0.30   # Fast downward head movement (primary signal)
+FALL_WEIGHT_TORSO_LEAN    = 0.25   # Torso angle from vertical (lateral collapse)
+FALL_WEIGHT_CRUMPLE       = 0.20   # Head-to-hip vertical collapse
+FALL_WEIGHT_ASPECT_RATIO  = 0.15   # Bbox wider than tall (on the ground)
+FALL_WEIGHT_LATERAL_VEL   = 0.10   # Sideways head velocity (catches lateral falls)
+FALL_CONFIDENCE_THRESHOLD = 0.55   # Lower than violence (0.65) — must not miss falls
+
+# Minimum lateral (horizontal) head velocity normalized by bbox width.
+# Calibration: normal sway 0.00–0.03, lateral collapses 0.06–0.30.
+FALL_LATERAL_VELOCITY_THRESHOLD = 0.05
+
+# Instantaneous (un-averaged) head drop threshold normalized by bbox height.
+# Catches sudden syncope/fainting spikes that 3-frame averaging smooths away.
+# Calibration: normal jitter < 0.04, fainting spikes 0.10–0.50+.
+FALL_INSTANT_DROP_THRESHOLD = 0.09
+
+# --- Post-Fall Immobility Detection ---
+# Maximum centroid displacement (px/frame, averaged over window) to consider
+# a person as immobile. Walking: 5–30 px/frame, stationary: 0–2 px/frame.
+IMMOBILITY_SPEED_THRESHOLD = 3.0
+
+# Number of frames over which to average centroid speed for immobility.
+IMMOBILITY_WINDOW_FRAMES = 10
+
+# Severity escalation timing (in seconds)
+SEVERITY_ESCALATION_MEDICAL = 0.5    # seconds on ground → MEDICAL_EMERGENCY
+SEVERITY_ESCALATION_CRITICAL = 5.0   # seconds immobile → CRITICAL_EMERGENCY
+
 
 # ============================================================
 # SMOOTHING: Exponential Moving Average (EMA)
@@ -360,7 +397,7 @@ def detect_advanced_violence(
 
 
 # ============================================================
-# FALL DETECTION (Production-Grade Multi-Factor)
+# FALL DETECTION (Production-Grade Weighted Confidence Scoring)
 # ============================================================
 def detect_fall(
     history: Dict[str, List[Tuple[float, float]]],
@@ -370,21 +407,29 @@ def detect_fall(
     crumple_threshold_norm: float = FALL_CRUMPLE_THRESHOLD,
 ) -> Tuple[bool, Dict[str, float]]:
     """
-    Detects a fall using scale-invariant multi-factor heuristics with
-    production-grade thresholds.
+    Detects a fall using weighted confidence scoring across 6 independent
+    signals — matching the proven violence detection architecture.
 
-    Five independent signals are checked:
-      1. HEAD DROP VELOCITY (3-frame averaged, normalized by bbox height)
-      2. ABSOLUTE PIXEL FLOOR (raw dy ≥ 8 px/frame)
-      3. ASPECT RATIO (bbox w/h > 1.3 — person is substantially wider than tall)
-      4. CRUMPLE RATIO (head-to-hip distance < 15% of bbox height)
-      5. TORSO LEAN ANGLE (shoulder-hip angle > 45° from vertical)
+    Instead of requiring ALL signals to pass strict boolean gates (which
+    misses real falls when one signal is borderline), each signal
+    contributes a weight to a total confidence score:
 
-    A fall is flagged when:
-      dropping AND abs_floor AND (wide OR crumpled OR leaning)
+      confidence = Σ (weight_i × signal_i_active)
 
-    Callers apply temporal debounce (20 frames / ~0.67s) to prevent
-    transient bending or squatting from latching as a fall.
+    A fall is flagged when confidence ≥ FALL_CONFIDENCE_THRESHOLD (0.55).
+
+    Hard gate: Absolute pixel floor must be met (prevents sub-pixel noise).
+
+    Six signals checked:
+      1. HEAD DROP VELOCITY (weight 0.30) — 3-frame averaged, normalized
+      2. TORSO LEAN ANGLE  (weight 0.25) — degrees from vertical
+      3. CRUMPLE RATIO     (weight 0.20) — head-to-hip collapse
+      4. ASPECT RATIO      (weight 0.15) — bbox wider than tall
+      5. LATERAL VELOCITY  (weight 0.10) — sideways head movement
+
+    Additional detection path: Instantaneous peak velocity (un-averaged)
+    catches sudden syncope/fainting spikes that 3-frame averaging would
+    smooth away. If instant_drop > threshold, confidence gets a 0.30 boost.
 
     Args:
         history:  Dict with keypoint histories.
@@ -396,13 +441,17 @@ def detect_fall(
     Returns:
         Tuple of (is_fall_now: bool, telemetry: dict).
         telemetry always contains:
-          'dy_norm': downward head velocity normalized by body height (3-frame avg)
-          'ar': bounding box aspect ratio
-          'crumple': head-to-hip distance normalized by body height
-          'torso_lean': torso angle from vertical in degrees
+          'dy_norm':       downward head velocity normalized by body height (3-frame avg)
+          'dy_instant':    instantaneous (un-averaged) head drop, normalized
+          'dx_norm':       lateral head velocity normalized by bbox width
+          'ar':            bounding box aspect ratio
+          'crumple':       head-to-hip distance normalized by body height
+          'torso_lean':    torso angle from vertical in degrees
+          'confidence':    weighted confidence score (0.0–1.0)
     """
     _null_telem: Dict[str, float] = {
-        'dy_norm': 0.0, 'ar': 0.0, 'crumple': 0.0, 'torso_lean': 0.0
+        'dy_norm': 0.0, 'dy_instant': 0.0, 'dx_norm': 0.0,
+        'ar': 0.0, 'crumple': 0.0, 'torso_lean': 0.0, 'confidence': 0.0,
     }
 
     if bbox_height < 1e-5:
@@ -413,23 +462,34 @@ def detect_fall(
         return False, _null_telem
 
     # ── 1. Scale-Invariant Velocity (3-frame averaged) ──────
-    # Average the head drop over the last 3 inter-frame intervals
-    # instead of just the last 2 positions. This dramatically
-    # reduces single-frame jitter false positives.
     smoothed_head = smooth_keypoints(head_hist)
     recent = smoothed_head[-4:]  # 4 points → 3 intervals
 
     dy_sum = 0.0
+    dx_sum = 0.0
     for k in range(1, len(recent)):
         dy_sum += (recent[k][1] - recent[k - 1][1])
+        dx_sum += abs(recent[k][0] - recent[k - 1][0])
     dy_avg = dy_sum / (len(recent) - 1)
+    dx_avg = dx_sum / (len(recent) - 1)
 
     dy_norm = dy_avg / bbox_height
+    dx_norm = dx_avg / max(bbox_width, 1e-5)
 
     # Absolute pixel velocity (un-normalized) for the floor check
     dy_abs = abs(dy_avg)
 
-    # ── 2. Aspect Ratio (Floor Test) ────────────────────────
+    # ── 1b. Instantaneous Peak Drop (un-averaged) ──────────
+    # Catches sudden syncope/fainting that 3-frame averaging smooths away.
+    # Use the single largest inter-frame drop in the recent window.
+    instant_drops = []
+    for k in range(1, len(recent)):
+        drop = (recent[k][1] - recent[k - 1][1])
+        if drop > 0:  # Only downward (positive Y = downward in image coords)
+            instant_drops.append(drop)
+    dy_instant = max(instant_drops) / bbox_height if instant_drops else 0.0
+
+    # ── 2. Aspect Ratio ─────────────────────────────────────
     bbox_ar = bbox_width / bbox_height
 
     # ── 3. Crumple Detection (Slump Test) ───────────────────
@@ -440,16 +500,10 @@ def detect_fall(
     if hip_L and hip_R:
         hip_mid_y = (hip_L[-1][1] + hip_R[-1][1]) / 2.0
         head_y = recent[-1][1]
-
-        # In image coords, Y increases downwards, so hips are usually > head
-        # Distance from head down to hips
         head_to_hip_dist = max(0.0, hip_mid_y - head_y)
         crumple_ratio = head_to_hip_dist / bbox_height
 
     # ── 4. Torso Lean Angle ─────────────────────────────────
-    # Compute the angle of the torso midline from vertical.
-    # Vertical = (0, -1) in image coords (Y up). We compute the angle
-    # between the shoulder-midpoint → hip-midpoint vector and vertical.
     shoulder_L = history.get('shoulder_L', [])
     shoulder_R = history.get('shoulder_R', [])
 
@@ -460,48 +514,140 @@ def detect_fall(
         hp_mid_x = (hip_L[-1][0] + hip_R[-1][0]) / 2.0
         hp_mid_y = (hip_L[-1][1] + hip_R[-1][1]) / 2.0
 
-        # Torso vector: shoulders → hips (in image coords, Y down)
         torso_dx = hp_mid_x - sh_mid_x
         torso_dy = hp_mid_y - sh_mid_y
         torso_len = np.sqrt(torso_dx ** 2 + torso_dy ** 2)
 
         if torso_len > 1e-5:
-            # Vertical reference: straight down = (0, 1) in image coords
-            # Angle between torso vector and vertical
-            cos_angle = torso_dy / torso_len  # dot with (0,1) = just the y-component
+            cos_angle = torso_dy / torso_len
             cos_angle = np.clip(cos_angle, -1.0, 1.0)
             torso_lean = float(np.degrees(np.arccos(cos_angle)))
+
+    # ── Weighted Confidence Scoring ─────────────────────────
+    confidence = 0.0
+
+    # Hard gate: absolute pixel floor must be met to prevent
+    # sub-pixel noise from ever triggering a fall.
+    is_above_floor = dy_abs >= FALL_VELOCITY_ABS_FLOOR
+
+    # Signal 1: Head drop velocity (3-frame averaged)
+    if dy_norm > velocity_threshold_norm:
+        confidence += FALL_WEIGHT_HEAD_DROP
+
+    # Signal 1b: Instantaneous peak drop boost (syncope/fainting)
+    # This is additive to the head drop weight when the un-averaged
+    # single-frame drop exceeds the instant threshold.
+    if dy_instant > FALL_INSTANT_DROP_THRESHOLD:
+        confidence += FALL_WEIGHT_HEAD_DROP  # Double the head-drop contribution
+
+    # Signal 2: Torso leaning heavily (lateral collapse)
+    if torso_lean > FALL_TORSO_LEAN_THRESHOLD:
+        confidence += FALL_WEIGHT_TORSO_LEAN
+
+    # Signal 3: Crumpled (head very close to hips vertically)
+    if crumple_ratio < crumple_threshold_norm:
+        confidence += FALL_WEIGHT_CRUMPLE
+
+    # Signal 4: Wide aspect ratio (person is on the ground)
+    if bbox_ar > FALL_AR_THRESHOLD:
+        confidence += FALL_WEIGHT_ASPECT_RATIO
+
+    # Signal 5: Lateral velocity (sideways collapse)
+    if dx_norm > FALL_LATERAL_VELOCITY_THRESHOLD:
+        confidence += FALL_WEIGHT_LATERAL_VEL
+
+    # Cap confidence at 1.0 (instantaneous boost can push above)
+    confidence = min(confidence, 1.0)
 
     # ── Build telemetry ─────────────────────────────────────
     telemetry: Dict[str, float] = {
         'dy_norm': dy_norm,
+        'dy_instant': dy_instant,
+        'dx_norm': dx_norm,
         'ar': bbox_ar,
         'crumple': crumple_ratio,
         'torso_lean': torso_lean,
+        'confidence': confidence,
     }
 
-    # ── Decision logic ──────────────────────────────────────
-    # Condition 1: Fast scale-invariant drop (3-frame averaged)
-    is_dropping = dy_norm > velocity_threshold_norm
-
-    # Condition 2: Absolute pixel floor (eliminates sub-pixel noise)
-    is_above_floor = dy_abs >= FALL_VELOCITY_ABS_FLOOR
-
-    # Condition 3: Wide aspect ratio (substantially on the ground)
-    is_wide = bbox_ar > FALL_AR_THRESHOLD
-
-    # Condition 4: Crumpled (head very close to hips vertically)
-    is_crumpled = crumple_ratio < crumple_threshold_norm
-
-    # Condition 5: Torso leaning heavily (lateral collapse)
-    is_leaning = torso_lean > FALL_TORSO_LEAN_THRESHOLD
-
-    # Fall triggers if:
-    #   dropping AND above absolute floor AND (wide OR crumpled OR leaning)
-    if is_dropping and is_above_floor and (is_wide or is_crumpled or is_leaning):
+    # ── Decision: weighted score ≥ threshold AND above floor ─
+    if is_above_floor and confidence >= FALL_CONFIDENCE_THRESHOLD:
         return True, telemetry
 
     return False, telemetry
+
+
+# ============================================================
+# POST-FALL IMMOBILITY DETECTION
+# ============================================================
+def detect_immobility(
+    history: Dict[str, List[Tuple[float, float]]],
+    speed_threshold: float = IMMOBILITY_SPEED_THRESHOLD,
+    window_frames: int = IMMOBILITY_WINDOW_FRAMES,
+) -> Tuple[bool, float]:
+    """
+    Detects whether a tracked person is immobile (not moving) by
+    measuring centroid displacement over a sliding window.
+
+    This is used AFTER a fall has been confirmed to escalate severity:
+      MEDICAL_EMERGENCY → CRITICAL_EMERGENCY when the person has been
+      immobile for an extended duration (e.g., unconscious).
+
+    Args:
+        history:  Dict with keypoint histories. Needs 'head', 'shoulder_L',
+                  'shoulder_R', 'hip_L', 'hip_R' for centroid computation.
+        speed_threshold: Maximum average centroid speed (px/frame) to be
+                         considered immobile. Default: 3.0 px/frame.
+        window_frames: Number of recent frames over which to average
+                       centroid speed. Default: 10.
+
+    Returns:
+        Tuple of (is_immobile: bool, avg_speed: float).
+        avg_speed is the computed centroid speed in pixels/frame.
+    """
+    # Compute centroid from available keypoints
+    head_hist = history.get('head', [])
+    sl_hist = history.get('shoulder_L', [])
+    sr_hist = history.get('shoulder_R', [])
+    hl_hist = history.get('hip_L', [])
+    hr_hist = history.get('hip_R', [])
+
+    # Find the minimum available length across all keypoint histories
+    all_hists = [h for h in [head_hist, sl_hist, sr_hist, hl_hist, hr_hist] if h]
+    if not all_hists:
+        return False, 999.0
+
+    min_len = min(len(h) for h in all_hists)
+    if min_len < max(2, window_frames):
+        return False, 999.0  # Not enough history
+
+    # Compute centroids for the recent window
+    window = min(window_frames, min_len)
+    centroids = []
+    for i in range(-window, 0):
+        points = []
+        for h in all_hists:
+            pt = h[i]
+            if pt != (0.0, 0.0):
+                points.append(pt)
+        if points:
+            cx = sum(p[0] for p in points) / len(points)
+            cy = sum(p[1] for p in points) / len(points)
+            centroids.append((cx, cy))
+
+    if len(centroids) < 2:
+        return False, 999.0
+
+    # Average frame-to-frame displacement
+    total_disp = 0.0
+    for i in range(1, len(centroids)):
+        dx = centroids[i][0] - centroids[i - 1][0]
+        dy = centroids[i][1] - centroids[i - 1][1]
+        total_disp += np.sqrt(dx ** 2 + dy ** 2)
+
+    avg_speed = total_disp / (len(centroids) - 1)
+
+    return avg_speed < speed_threshold, avg_speed
 
 
 # ============================================================

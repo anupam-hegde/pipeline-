@@ -5,13 +5,16 @@
   "3": "Action Math & Violence Detection",
   "4": "FastAPI WebSocket & Webcam Server",
   "5": "Dataset Preparation & Directory Creation",
+  "6": "video_websocket",
   "7": "Directory Video Testing & Extraction",
-  "8": "Video Pose Extraction & Testing",
+  "8": "diagnostic_run.py",
   "9": "Fall Detection & Emergency Monitoring",
   "10": "RTMPose Pipeline Inference",
+  "11": "video_websocket",
   "12": "Graphify AI Agent Rules",
   "13": "Graphify Workflow Automation",
   "14": "Backend Module Initialization",
   "15": "YOLOX Training Log History",
-  "16": "Project Python Dependencies"
+  "16": "Project Python Dependencies",
+  "17": ".draw_hud"
 }

@@ -162,15 +162,15 @@ class RTMPosePipeline:
         return batch
 
 
-class YOLOXObjectDetector:
-    """YOLOX detector wrapper for custom fire/weapon detection.
+class ONNXObjectDetector:
+    """Universal ONNX detector wrapper for real-time surveillance (Fire/Smoke/Person/Weapon).
 
-    Runs YOLOX-s ONNX export via ONNX Runtime (TensorRT/CUDA). All
-    coordinate outputs are in xyxy pixel format. Class IDs follow the
-    project schema defined during training: 0=fire, 1=weapon.
+    Runs trained YOLO/YOLOX ONNX models (`best.onnx`) via ONNX Runtime using
+    CUDA Execution Provider with automatic fallback to CPU. All coordinate
+    outputs are returned in pixel `xyxy` format via `ObjectDetectionBatch`.
 
-    If the ONNX model is not found, ``from_env`` returns ``None`` so
-    callers silently fall back to pose-only mode.
+    If the ONNX model path is not found, `from_env` returns `None` so callers
+    silently fall back to pose-only mode without breaking.
     """
 
     def __init__(self, onnx_path: str, device: Optional[str] = None) -> None:
@@ -178,22 +178,22 @@ class YOLOXObjectDetector:
             import onnxruntime as ort
         except ImportError as exc:
             raise RuntimeError(
-                "YOLOX detection requires onnxruntime-gpu. Install it from requirements.txt."
+                "ONNX detection requires onnxruntime-gpu. Install it from requirements.txt."
             ) from exc
 
         self._onnx_path = Path(onnx_path)
         self._input_size = (640, 640)
 
+        # Prioritize CUDA Execution Provider if requested or available, fallback to CPU
         providers = (
             ["CUDAExecutionProvider", "CPUExecutionProvider"]
-            if device and "cuda" in device.lower()
+            if (device and "cuda" in device.lower()) or (device is None)
             else ["CPUExecutionProvider"]
         )
         session_opts = ort.SessionOptions()
         session_opts.log_severity_level = 3
-        session_opts.graph_optimization_level = (
-            ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        )
+        session_opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+
         try:
             self._session = ort.InferenceSession(
                 str(self._onnx_path),
@@ -201,6 +201,7 @@ class YOLOXObjectDetector:
                 providers=providers,
             )
         except Exception:
+            # Fallback cleanly if CUDA provider is unavailable or fails
             self._session = ort.InferenceSession(
                 str(self._onnx_path),
                 sess_options=session_opts,
@@ -209,16 +210,23 @@ class YOLOXObjectDetector:
 
         self._input_name = self._session.get_inputs()[0].name
         self._output_name = self._session.get_outputs()[0].name
+        active_provider = self._session.get_providers()[0]
+        print(f"[*] ONNXObjectDetector initialized: {self._onnx_path.name} on {active_provider}")
 
     @classmethod
-    def from_env(cls) -> Optional["YOLOXObjectDetector"]:
-        onnx_path = os.getenv(
-            "YOLOX_ONNX_MODEL",
+    def from_env(cls) -> Optional["ONNXObjectDetector"]:
+        # Check environment variable first, then best.onnx right in repo root, then models/
+        candidate_paths = [
+            os.getenv("ONNX_DETECTION_MODEL"),
+            os.getenv("YOLOX_ONNX_MODEL"),
+            "best.onnx",
+            "models/best.onnx",
             "models/yolox_surveillance.onnx",
-        )
-        if not Path(onnx_path).exists():
-            return None
-        return cls(onnx_path=onnx_path, device=os.getenv("CV_DEVICE") or None)
+        ]
+        for path_str in candidate_paths:
+            if path_str and Path(path_str).exists():
+                return cls(onnx_path=path_str, device=os.getenv("CV_DEVICE") or None)
+        return None
 
     def predict(
         self, frame: np.ndarray, confidence: float = 0.45
@@ -232,7 +240,7 @@ class YOLOXObjectDetector:
         ort_inputs = {self._input_name: blob}
         raw = self._session.run([self._output_name], ort_inputs)[0]
 
-        return _decode_yolox_output(
+        return _decode_onnx_detector_output(
             raw, scale, pad_left, pad_top, frame.shape[:2], confidence
         )
 
@@ -241,12 +249,13 @@ def create_pose_pipeline() -> RTMPosePipeline:
     return RTMPosePipeline.from_env()
 
 
-def create_object_detector() -> Optional[YOLOXObjectDetector]:
-    return YOLOXObjectDetector.from_env()
+def create_object_detector() -> Optional[ONNXObjectDetector]:
+    return ONNXObjectDetector.from_env()
 
 
-# Compatibility layer: alias RTMDetObjectDetector to YOLOXObjectDetector so legacy imports continue to work
-RTMDetObjectDetector = YOLOXObjectDetector
+# Compatibility layer: alias legacy classes to ONNXObjectDetector so downstream modules require no changes
+YOLOXObjectDetector = ONNXObjectDetector
+RTMDetObjectDetector = ONNXObjectDetector
 
 
 # ---------------------------------------------------------------------------
@@ -280,6 +289,88 @@ def _letterbox(
         value=(114, 114, 114),
     )
     return padded, scale, pad_left, pad_top
+
+
+def _decode_onnx_detector_output(
+    raw: np.ndarray,
+    scale: float,
+    pad_left: int,
+    pad_top: int,
+    frame_shape: tuple[int, int],
+    conf_thr: float,
+) -> ObjectDetectionBatch:
+    """Decode raw ONNX tensor outputs to ObjectDetectionBatch.
+
+    Supports both:
+      1. Ultralytics YOLOv8/YOLO11 format: (1, 4+num_classes, num_anchors) e.g. (1, 7, 8400)
+         or (1, num_anchors, 4+num_classes) e.g. (1, 8400, 7)
+      2. YOLOX format: anchor-free raw block decoding across strides 8, 16, 32.
+    """
+    nms_thr = 0.45
+    fh, fw = frame_shape
+
+    # --- Check for Ultralytics format: (batch, channels, anchors) e.g., (1, 7, 8400) ---
+    if raw.ndim == 3:
+        if raw.shape[1] < raw.shape[2] and raw.shape[1] >= 5:
+            # Shape is (1, 4+C, anchors) -> transpose to (anchors, 4+C)
+            preds = raw[0].T
+        elif raw.shape[2] < raw.shape[1] and raw.shape[2] >= 5:
+            # Shape is (1, anchors, 4+C) -> squeeze to (anchors, 4+C)
+            preds = raw[0]
+        else:
+            preds = raw[0]
+
+        if preds.shape[1] >= 5:
+            # Columns 0..3: cx, cy, w, h
+            # Columns 4..: class probabilities
+            box_raw = preds[:, :4]
+            cls_probs = preds[:, 4:]
+            scores = np.max(cls_probs, axis=1)
+            classes = np.argmax(cls_probs, axis=1)
+
+            mask = scores > conf_thr
+            if not np.any(mask):
+                return ObjectDetectionBatch.empty()
+
+            box_raw = box_raw[mask]
+            scores = scores[mask].astype(np.float32)
+            classes = classes[mask].astype(np.int32)
+
+            cx = box_raw[:, 0]
+            cy = box_raw[:, 1]
+            bw = box_raw[:, 2]
+            bh = box_raw[:, 3]
+
+            x1 = (cx - bw / 2.0 - pad_left) / scale
+            y1 = (cy - bh / 2.0 - pad_top) / scale
+            x2 = (cx + bw / 2.0 - pad_left) / scale
+            y2 = (cy + bh / 2.0 - pad_top) / scale
+
+            x1 = np.clip(x1, 0.0, float(fw))
+            y1 = np.clip(y1, 0.0, float(fh))
+            x2 = np.clip(x2, 0.0, float(fw))
+            y2 = np.clip(y2, 0.0, float(fh))
+
+            valid = (x2 - x1 >= 1.0) & (y2 - y1 >= 1.0)
+            if not np.any(valid):
+                return ObjectDetectionBatch.empty()
+
+            boxes_np = np.stack([x1[valid], y1[valid], x2[valid], y2[valid]], axis=1).astype(np.float32)
+            scores_np = scores[valid]
+            classes_np = classes[valid]
+
+            keep_idx = _nms(boxes_np, scores_np, nms_thr)
+            if len(keep_idx) == 0:
+                return ObjectDetectionBatch.empty()
+
+            return ObjectDetectionBatch(
+                xyxy=boxes_np[keep_idx],
+                confidence=scores_np[keep_idx],
+                class_id=classes_np[keep_idx],
+            )
+
+    # --- Fallback to legacy YOLOX grid decoding ---
+    return _decode_yolox_output(raw, scale, pad_left, pad_top, frame_shape, conf_thr)
 
 
 def _decode_yolox_output(
@@ -429,24 +520,30 @@ def bbox_iou(box_a: np.ndarray, box_b: np.ndarray) -> float:
     return intersection / union
 
 
-def draw_object_detections(frame: np.ndarray, detections: ObjectDetectionBatch) -> None:
-    """Draw fire/weapon outputs from the custom object detector."""
+def draw_object_detections(frame: np.ndarray, detections: ObjectDetectionBatch, skip_person: bool = True) -> None:
+    """Draw fire/smoke/weapon/person outputs from the ONNX detector."""
 
     for bbox, score, class_id in zip(
         detections.xyxy,
         detections.confidence,
         detections.class_id,
     ):
-        if int(class_id) not in {0, 1}:
-            continue
-
+        cid = int(class_id)
         x1, y1, x2, y2 = map(int, bbox)
-        if int(class_id) == 0:
+
+        if cid == 0:
             label = f"FIRE WARNING {float(score):.2f}"
-            color = (0, 165, 255)
-        else:
-            label = f"WEAPON DETECTED {float(score):.2f}"
+            color = (0, 165, 255)  # Orange-Red
+        elif cid == 2:
+            label = f"SMOKE WARNING {float(score):.2f}"
+            color = (200, 200, 200)  # Gray/White
+        elif cid == 1:
+            if skip_person:
+                continue
+            label = f"ONNX PERSON {float(score):.2f}"
             color = (255, 0, 0)
+        else:
+            continue
 
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
         cv2.putText(
